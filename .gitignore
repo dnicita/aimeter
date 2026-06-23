@@ -1,0 +1,12 @@
+# Build artifacts
+app/build/
+*.app
+
+# Reference clone & local backups (not part of the fork)
+upstream/
+backups/
+
+# Local tooling / OS
+.claude/
+.DS_Store
+*.log
