@@ -234,13 +234,13 @@ enum LoginItemManager {
 // MARK: - Per-window identity palette
 // Session=green, Weekly=blue, Sonnet=orange. Red = "limit reached" alarm.
 enum Palette {
-    static let sessionNS = NSColor(srgbRed: 0.18, green: 0.82, blue: 0.35, alpha: 1) // #30D158
+    static let sessionNS = NSColor(srgbRed: 0.13, green: 0.62, blue: 0.27, alpha: 1) // #219E45 darker green
     static let weeklyNS  = NSColor(srgbRed: 0.35, green: 0.78, blue: 0.98, alpha: 1) // #5AC8FA bright sky blue
     static let sonnetNS  = NSColor(srgbRed: 1.00, green: 0.62, blue: 0.04, alpha: 1) // #FF9F0A
     static let alertNS   = NSColor(srgbRed: 1.00, green: 0.23, blue: 0.19, alpha: 1) // red
     static let warnNS    = NSColor(srgbRed: 1.00, green: 0.80, blue: 0.00, alpha: 1) // yellow
 
-    static let session = Color(.sRGB, red: 0.18, green: 0.82, blue: 0.35)
+    static let session = Color(.sRGB, red: 0.13, green: 0.62, blue: 0.27)
     static let weekly  = Color(.sRGB, red: 0.35, green: 0.78, blue: 0.98)
     static let sonnet  = Color(.sRGB, red: 1.00, green: 0.62, blue: 0.04)
     static let alert   = Color(.sRGB, red: 1.00, green: 0.23, blue: 0.19)
