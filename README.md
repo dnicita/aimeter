@@ -41,3 +41,6 @@ auto‑refreshes; you're notified if it expires.
 
 ## License
 MIT — see [LICENSE](LICENSE). Retains the original ClaudeUsageBar copyright.
+
+---
+<sub>Built and maintained with the help of [Claude Code](https://claude.com/claude-code) (Anthropic).</sub>
