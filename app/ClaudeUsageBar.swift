@@ -752,12 +752,39 @@ class UsageManager: ObservableObject {
     @Published var refreshIntervalMinutes: Int = 5      // configurable poll interval
     @Published var loginItemStatus: String = "—"        // real SMAppService status string
 
-    // Menu-bar display toggles (default: only the primary session %)
-    @Published var showSessionTimer: Bool = false
-    @Published var showWeeklyPercent: Bool = false
-    @Published var showWeeklyTimer: Bool = false
-    @Published var showSonnetPercent: Bool = false
+    // Menu-bar display modes per extra value (default: Off → only primary %).
+    // mode: 0 = Off, 1 = Always, 2 = When (conditional on the threshold).
+    // % thresholds mean "show if ≥ N%"; timer thresholds mean "show if reset ≤ N min".
+    @Published var sessionTimerMode: Int = 0
+    @Published var sessionTimerThreshold: Int = 60      // minutes
+    @Published var weeklyPercentMode: Int = 0
+    @Published var weeklyPercentThreshold: Int = 80     // percent
+    @Published var weeklyTimerMode: Int = 0
+    @Published var weeklyTimerThreshold: Int = 60       // minutes
+    @Published var sonnetPercentMode: Int = 0
+    @Published var sonnetPercentThreshold: Int = 80     // percent
     @Published var blinkEnabled: Bool = true
+
+    private func minutesUntil(_ date: Date?) -> Int? {
+        guard let date = date else { return nil }
+        let s = Int(date.timeIntervalSinceNow)
+        return s > 0 ? s / 60 : 0
+    }
+    private func showPercent(mode: Int, value: Int, threshold: Int) -> Bool {
+        switch mode { case 1: return true; case 2: return value >= threshold; default: return false }
+    }
+    private func showTimer(mode: Int, date: Date?, threshold: Int) -> Bool {
+        switch mode {
+        case 1: return true
+        case 2: if let m = minutesUntil(date) { return m <= threshold }; return false
+        default: return false
+        }
+    }
+    // Effective visibility used by the menu-bar title builder.
+    var showSessionTimer: Bool { showTimer(mode: sessionTimerMode, date: sessionResetsAt, threshold: sessionTimerThreshold) }
+    var showWeeklyPercent: Bool { showPercent(mode: weeklyPercentMode, value: weeklyUsage, threshold: weeklyPercentThreshold) }
+    var showWeeklyTimer: Bool { showTimer(mode: weeklyTimerMode, date: weeklyResetsAt, threshold: weeklyTimerThreshold) }
+    var showSonnetPercent: Bool { showPercent(mode: sonnetPercentMode, value: weeklySonnetUsage, threshold: sonnetPercentThreshold) }
 
     // Countdown to each window's reset (e.g. "1h59m", "2d17h", "<1m"); nil if unknown.
     var sessionResetCountdown: String? { UsageManager.countdown(to: sessionResetsAt) }
@@ -860,13 +887,17 @@ class UsageManager: ObservableObject {
         let savedInterval = UserDefaults.standard.integer(forKey: "refresh_interval_minutes")
         refreshIntervalMinutes = savedInterval > 0 ? min(max(savedInterval, 1), 60) : 5
 
-        // Menu-bar display toggles + blink (defaults: off / on).
-        showSessionTimer  = UserDefaults.standard.bool(forKey: "show_session_timer")
-        showWeeklyPercent = UserDefaults.standard.bool(forKey: "show_weekly_percent")
-        showWeeklyTimer   = UserDefaults.standard.bool(forKey: "show_weekly_timer")
-        showSonnetPercent = UserDefaults.standard.bool(forKey: "show_sonnet_percent")
-        blinkEnabled = UserDefaults.standard.object(forKey: "blink_enabled") == nil
-            ? true : UserDefaults.standard.bool(forKey: "blink_enabled")
+        // Menu-bar display modes/thresholds + blink.
+        let d = UserDefaults.standard
+        sessionTimerMode = d.integer(forKey: "session_timer_mode")
+        weeklyPercentMode = d.integer(forKey: "weekly_percent_mode")
+        weeklyTimerMode = d.integer(forKey: "weekly_timer_mode")
+        sonnetPercentMode = d.integer(forKey: "sonnet_percent_mode")
+        if d.object(forKey: "session_timer_thr") != nil { sessionTimerThreshold = d.integer(forKey: "session_timer_thr") }
+        if d.object(forKey: "weekly_percent_thr") != nil { weeklyPercentThreshold = d.integer(forKey: "weekly_percent_thr") }
+        if d.object(forKey: "weekly_timer_thr")  != nil { weeklyTimerThreshold  = d.integer(forKey: "weekly_timer_thr") }
+        if d.object(forKey: "sonnet_percent_thr") != nil { sonnetPercentThreshold = d.integer(forKey: "sonnet_percent_thr") }
+        blinkEnabled = d.object(forKey: "blink_enabled") == nil ? true : d.bool(forKey: "blink_enabled")
         // Default shortcut to enabled if not previously set
         if UserDefaults.standard.object(forKey: "shortcut_enabled") == nil {
             shortcutEnabled = true
@@ -880,11 +911,16 @@ class UsageManager: ObservableObject {
         UserDefaults.standard.set(statusNotificationsEnabled, forKey: "status_notifications_enabled")
         UserDefaults.standard.set(shortcutEnabled, forKey: "shortcut_enabled")
         UserDefaults.standard.set(refreshIntervalMinutes, forKey: "refresh_interval_minutes")
-        UserDefaults.standard.set(showSessionTimer,  forKey: "show_session_timer")
-        UserDefaults.standard.set(showWeeklyPercent, forKey: "show_weekly_percent")
-        UserDefaults.standard.set(showWeeklyTimer,   forKey: "show_weekly_timer")
-        UserDefaults.standard.set(showSonnetPercent, forKey: "show_sonnet_percent")
-        UserDefaults.standard.set(blinkEnabled,      forKey: "blink_enabled")
+        let d = UserDefaults.standard
+        d.set(sessionTimerMode, forKey: "session_timer_mode")
+        d.set(weeklyPercentMode, forKey: "weekly_percent_mode")
+        d.set(weeklyTimerMode, forKey: "weekly_timer_mode")
+        d.set(sonnetPercentMode, forKey: "sonnet_percent_mode")
+        d.set(sessionTimerThreshold, forKey: "session_timer_thr")
+        d.set(weeklyPercentThreshold, forKey: "weekly_percent_thr")
+        d.set(weeklyTimerThreshold, forKey: "weekly_timer_thr")
+        d.set(sonnetPercentThreshold, forKey: "sonnet_percent_thr")
+        d.set(blinkEnabled, forKey: "blink_enabled")
         UserDefaults.standard.synchronize()
     }
 
@@ -2295,22 +2331,23 @@ struct UsageView: View {
 
                     Divider()
 
-                    // Menu-bar display (fork): which values appear in the bar.
-                    VStack(alignment: .leading, spacing: 6) {
+                    // Menu-bar display (fork): each extra value can be Off / Always /
+                    // When (conditional on a %-or-time threshold).
+                    VStack(alignment: .leading, spacing: 8) {
                         Text("Show in menu bar")
                             .font(.caption).fontWeight(.semibold)
-                        menuBarToggle("Session reset timer", Palette.session,
-                                      get: { usageManager.showSessionTimer },
-                                      set: { usageManager.showSessionTimer = $0 })
-                        menuBarToggle("Weekly usage %", Palette.weekly,
-                                      get: { usageManager.showWeeklyPercent },
-                                      set: { usageManager.showWeeklyPercent = $0 })
-                        menuBarToggle("Weekly reset timer", Palette.weekly,
-                                      get: { usageManager.showWeeklyTimer },
-                                      set: { usageManager.showWeeklyTimer = $0 })
-                        menuBarToggle("Weekly Sonnet usage %", Palette.sonnet,
-                                      get: { usageManager.showSonnetPercent },
-                                      set: { usageManager.showSonnetPercent = $0 })
+                        barRow("Session reset timer", Palette.session, isPercent: false,
+                               modeGet: { usageManager.sessionTimerMode }, modeSet: { usageManager.sessionTimerMode = $0 },
+                               thrGet: { usageManager.sessionTimerThreshold }, thrSet: { usageManager.sessionTimerThreshold = $0 })
+                        barRow("Weekly usage %", Palette.weekly, isPercent: true,
+                               modeGet: { usageManager.weeklyPercentMode }, modeSet: { usageManager.weeklyPercentMode = $0 },
+                               thrGet: { usageManager.weeklyPercentThreshold }, thrSet: { usageManager.weeklyPercentThreshold = $0 })
+                        barRow("Weekly reset timer", Palette.weekly, isPercent: false,
+                               modeGet: { usageManager.weeklyTimerMode }, modeSet: { usageManager.weeklyTimerMode = $0 },
+                               thrGet: { usageManager.weeklyTimerThreshold }, thrSet: { usageManager.weeklyTimerThreshold = $0 })
+                        barRow("Weekly Sonnet usage %", Palette.sonnet, isPercent: true,
+                               modeGet: { usageManager.sonnetPercentMode }, modeSet: { usageManager.sonnetPercentMode = $0 },
+                               thrGet: { usageManager.sonnetPercentThreshold }, thrSet: { usageManager.sonnetPercentThreshold = $0 })
                         Toggle(isOn: Binding(
                             get: { usageManager.blinkEnabled },
                             set: { usageManager.blinkEnabled = $0; usageManager.applyMenuBarSettings() }
@@ -2455,16 +2492,34 @@ struct UsageView: View {
         return "v\(short) · build \(build)"
     }
 
-    /// A checkbox toggle (label tinted in its window color) that persists and
-    /// refreshes the menu-bar icon immediately.
+    /// One configurable menu-bar value: label + mode picker (Off/Always/When) and,
+    /// when "When", a threshold stepper (% for percentages, minutes for timers).
     @ViewBuilder
-    private func menuBarToggle(_ label: String, _ color: Color,
-                               get: @escaping () -> Bool,
-                               set: @escaping (Bool) -> Void) -> some View {
-        Toggle(isOn: Binding(get: get, set: { v in set(v); usageManager.applyMenuBarSettings() })) {
-            Text(label).font(.caption2).foregroundColor(color)
+    private func barRow(_ label: String, _ color: Color, isPercent: Bool,
+                        modeGet: @escaping () -> Int, modeSet: @escaping (Int) -> Void,
+                        thrGet: @escaping () -> Int, thrSet: @escaping (Int) -> Void) -> some View {
+        VStack(alignment: .leading, spacing: 2) {
+            HStack {
+                Text(label).font(.caption2).foregroundColor(color)
+                Spacer()
+                Picker("", selection: Binding(get: modeGet, set: { modeSet($0); usageManager.applyMenuBarSettings() })) {
+                    Text("Off").tag(0)
+                    Text("Always").tag(1)
+                    Text("When…").tag(2)
+                }
+                .labelsHidden().pickerStyle(.menu).font(.caption2).fixedSize()
+            }
+            if modeGet() == 2 {
+                let thr = Binding(get: thrGet, set: { thrSet($0); usageManager.applyMenuBarSettings() })
+                if isPercent {
+                    Stepper("show if ≥ \(thrGet())%", value: thr, in: 0...100, step: 5)
+                        .font(.caption2).foregroundColor(.secondary)
+                } else {
+                    Stepper("show if reset ≤ \(thrGet()) min", value: thr, in: 5...300, step: 15)
+                        .font(.caption2).foregroundColor(.secondary)
+                }
+            }
         }
-        .toggleStyle(.checkbox)
     }
 
     func formatNumber(_ number: Int) -> String {
