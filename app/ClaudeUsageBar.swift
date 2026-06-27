@@ -233,6 +233,7 @@ enum LoginItemManager {
 
 // MARK: - Per-window identity palette
 // Session=green, Weekly=blue, Sonnet=orange. Red = "limit reached" alarm.
+// Menu-bar colors stay bright (translucent backdrop); popover colors run darker.
 enum Palette {
     // Menu-bar green: kept bright/luminous so it stays legible over the translucent
     // menu bar (which sits on the desktop wallpaper). The popover green below is
