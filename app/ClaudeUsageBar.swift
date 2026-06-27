@@ -234,7 +234,10 @@ enum LoginItemManager {
 // MARK: - Per-window identity palette
 // Session=green, Weekly=blue, Sonnet=orange. Red = "limit reached" alarm.
 enum Palette {
-    static let sessionNS = NSColor(srgbRed: 0.13, green: 0.62, blue: 0.27, alpha: 1) // #219E45 darker green
+    // Menu-bar green: kept bright/luminous so it stays legible over the translucent
+    // menu bar (which sits on the desktop wallpaper). The popover green below is
+    // darker on purpose — it sits on a light, opaque background.
+    static let sessionNS = NSColor(srgbRed: 0.18, green: 0.82, blue: 0.35, alpha: 1) // #30D158 system green
     static let weeklyNS  = NSColor(srgbRed: 0.35, green: 0.78, blue: 0.98, alpha: 1) // #5AC8FA bright sky blue
     static let sonnetNS  = NSColor(srgbRed: 1.00, green: 0.62, blue: 0.04, alpha: 1) // #FF9F0A
     static let alertNS   = NSColor(srgbRed: 1.00, green: 0.23, blue: 0.19, alpha: 1) // red
@@ -278,7 +281,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
     var hotKeyRef: EventHotKeyRef?
     var eventHandlerRef: EventHandlerRef?   // Carbon handler; removed on unregister to avoid leak/dup
     var usageTimer: Timer?
-    // Last measured SwiftUI content height; used to size the popover before showing.
+    // Last measured SwiftUI content height; used to size the popover before each show.
     var lastPopoverHeight: CGFloat = 360
     // Menu-bar icon / blink state
     var lastSessionPercent: Int = 0
@@ -317,7 +320,14 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         // Refresh the menu-bar icon (center status dot) whenever service status changes.
         statusManager.onStatusChange = { [weak self] in self?.redrawStatusIcon() }
 
-        // Create popover
+        // Create popover. We size it ourselves (sizingOptions = []) and set contentSize
+        // ONLY before showing (in openPopover). Two AppKit traps this avoids:
+        //  • Letting the hosting controller auto-grow the popover from SwiftUI's
+        //    intrinsic size makes NSPopover expand UPWARD off the top of the screen —
+        //    you can't scroll to the top.
+        //  • Mutating contentSize while the popover is already visible makes NSPopover
+        //    drop its anchor and jump to the screen's left edge.
+        // So: one fixed size per showing; taller content scrolls inside.
         popover = NSPopover()
         popover.contentSize = NSSize(width: AppDelegate.popoverWidth, height: 360)
         popover.behavior = .transient
@@ -326,9 +336,6 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
             usageManager: usageManager,
             statusManager: statusManager
         ))
-        // Don't let the hosting controller auto-grow the popover from SwiftUI's
-        // intrinsic size — that growth happens AFTER positioning and pushes the
-        // top off-screen. We size the popover ourselves via setPopoverHeight().
         if #available(macOS 13.0, *) {
             hosting.sizingOptions = []
         }
@@ -488,12 +495,11 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
             // Already on main here — refresh synchronously so it takes effect before show.
             usageManager.updatePercentages()
 
-            // Drive the popover size EXPLICITLY from the last known content height
-            // before showing. If we let NSPopover auto-grow after the SwiftUI content
-            // measures itself, it expands upward (anchored at the bottom) and pushes
-            // the top off the screen. Setting contentSize ourselves makes NSPopover
-            // place and keep the window on-screen.
-            popover.contentSize = NSSize(width: AppDelegate.popoverWidth, height: clampedPopoverHeight(lastPopoverHeight))
+            // Size the popover from the last measured content height BEFORE showing.
+            // (Resizing AFTER show is what breaks NSPopover's anchoring / pushes the
+            // top off-screen — so we never do it while visible.)
+            popover.contentSize = NSSize(width: AppDelegate.popoverWidth,
+                                         height: clampedPopoverHeight(lastPopoverHeight))
             popover.show(relativeTo: button.bounds, of: button, preferredEdge: .minY)
 
             // Tear down any stale monitor before adding a fresh one (a transient
@@ -525,21 +531,24 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         removeEventMonitor()
     }
 
-    /// Clamp a desired popover height to what fits below the menu bar on screen.
+    /// Clamp a desired popover height to fit below the menu bar on the screen the
+    /// status item actually lives on (NOT `NSScreen.main`, which follows the active
+    /// Space/key window and gives wrong results per virtual desktop). Capped well
+    /// below full height so a long Settings list scrolls instead of growing the
+    /// popover until AppKit mis-places it.
     func clampedPopoverHeight(_ h: CGFloat) -> CGFloat {
-        let maxH = (NSScreen.main?.visibleFrame.height ?? 800) - 20
+        let screen = statusItem?.button?.window?.screen ?? NSScreen.main
+        let maxH = min((screen?.visibleFrame.height ?? 800) - 20, 600)
         return min(max(h, 120), maxH)
     }
 
-    /// Called by the SwiftUI view when its content height changes. Keeps the
-    /// popover sized to the content and repositions it on-screen (NSPopover keeps
-    /// the window visible when you set contentSize explicitly).
+    /// Remember the SwiftUI-measured content height to size the popover at the NEXT
+    /// open. We deliberately do NOT resize while the popover is visible — mutating a
+    /// shown NSPopover's contentSize makes it jump to the screen edge and pushes the
+    /// top off-screen. Content taller than the popover simply scrolls (Settings
+    /// auto-scrolls into view).
     func setPopoverHeight(_ h: CGFloat) {
-        let clamped = clampedPopoverHeight(h)
-        lastPopoverHeight = clamped
-        if popover.isShown {
-            popover.contentSize = NSSize(width: AppDelegate.popoverWidth, height: clamped)
-        }
+        lastPopoverHeight = clampedPopoverHeight(h)
     }
 
     var blinkEnabled: Bool { usageManager?.blinkEnabled ?? true }
@@ -984,8 +993,8 @@ class UsageManager: ObservableObject {
         delegate?.restartUsageTimer()
     }
 
-    /// Forward the SwiftUI-measured content height to the AppDelegate so it can
-    /// size the popover correctly (and keep it on-screen).
+    /// Forward the SwiftUI-measured content height to the AppDelegate so it can size
+    /// the popover at the next open.
     func reportPopoverHeight(_ h: CGFloat) {
         delegate?.setPopoverHeight(h)
     }
@@ -1771,13 +1780,13 @@ struct UsageView: View {
                         }
                     )
             }
-            // Width is fixed; the HEIGHT is controlled by the AppDelegate via the
-            // popover's contentSize (see setPopoverHeight). The ScrollView fills it.
+            // Width is fixed; the height is set by the AppDelegate on the popover's
+            // contentSize before each show. The ScrollView fills it and scrolls when
+            // the content (e.g. the Settings panel) is taller.
             .frame(width: AppDelegate.popoverWidth)
             .onPreferenceChange(ContentHeightKey.self) { value in
                 guard value > 0 else { return }
-                // Tell AppKit the real content height so it sizes/positions the
-                // popover correctly (and keeps it on-screen).
+                // Remembered for the NEXT open; we don't resize while shown.
                 usageManager.reportPopoverHeight(value)
             }
             .onAppear {
