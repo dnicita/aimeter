@@ -34,7 +34,8 @@ if [ -f "$ICNS" ]; then
       || /usr/libexec/PlistBuddy -c "Set :CFBundleIconFile $APP" "$APP_PATH/Contents/Info.plist"
 fi
 
-FRAMEWORKS=(-framework SwiftUI -framework AppKit -framework WebKit -framework ServiceManagement)
+# WebKit/ServiceManagement were once linked here but the source no longer uses them.
+FRAMEWORKS=(-framework SwiftUI -framework AppKit)
 
 echo "  • arm64…"
 swiftc -parse-as-library -O -o "$APP_PATH/Contents/MacOS/${APP}_arm64" \

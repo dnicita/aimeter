@@ -7,7 +7,7 @@
 //  Architecture (top → bottom in this file):
 //    • KeychainHelper   — stores the claude.ai session cookie in the login Keychain
 //    • LoginItemManager — real launch-at-login via a per-user LaunchAgent
-//    • Palette          — per-window identity colors (session/weekly/sonnet)
+//    • Palette          — per-window identity colors (session/weekly/per-model)
 //    • AppDelegate      — status-bar item, popover, menu-bar ring icon + blink, Cmd+U hotkey
 //    • UsageManager     — polls claude.ai usage API; owns all usage state + notifications
 //    • StatusManager    — polls status.claude.com; tracks per-component outages
@@ -19,7 +19,6 @@
 //
 import SwiftUI
 import AppKit
-import WebKit
 import Carbon
 import Security
 
@@ -186,8 +185,11 @@ enum LoginItemManager {
         let domain = "gui/\(uid)"
         if enabled {
             // Launch the .app bundle (not the raw binary) so it starts in the GUI
-            // session exactly as a double-click would.
+            // session exactly as a double-click would. Escape XML-special chars so
+            // an unusual install path can't break (or inject into) the plist.
             let appPath = Bundle.main.bundlePath
+                .replacingOccurrences(of: "&", with: "&amp;")
+                .replacingOccurrences(of: "<", with: "&lt;")
             let plist = """
             <?xml version="1.0" encoding="UTF-8"?>
             <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -232,21 +234,21 @@ enum LoginItemManager {
 }
 
 // MARK: - Per-window identity palette
-// Session=green, Weekly=blue, Sonnet=orange. Red = "limit reached" alarm.
+// Session=green, Weekly=blue, per-model weekly (e.g. Fable)=orange. Red = alarm.
 // Menu-bar colors stay bright (translucent backdrop); popover colors run darker.
 enum Palette {
-    // Menu-bar green: kept bright/luminous so it stays legible over the translucent
-    // menu bar (which sits on the desktop wallpaper). The popover green below is
-    // darker on purpose — it sits on a light, opaque background.
+    // Menu-bar colors: kept bright/luminous so they stay legible over the
+    // translucent menu bar (which sits on the desktop wallpaper). The popover
+    // variants below are darker on purpose — they sit on an opaque background.
     static let sessionNS = NSColor(srgbRed: 0.18, green: 0.82, blue: 0.35, alpha: 1) // #30D158 system green
     static let weeklyNS  = NSColor(srgbRed: 0.35, green: 0.78, blue: 0.98, alpha: 1) // #5AC8FA bright sky blue
-    static let sonnetNS  = NSColor(srgbRed: 1.00, green: 0.62, blue: 0.04, alpha: 1) // #FF9F0A
+    static let modelNS   = NSColor(srgbRed: 1.00, green: 0.62, blue: 0.04, alpha: 1) // #FF9F0A
     static let alertNS   = NSColor(srgbRed: 1.00, green: 0.23, blue: 0.19, alpha: 1) // red
     static let warnNS    = NSColor(srgbRed: 1.00, green: 0.80, blue: 0.00, alpha: 1) // yellow
 
-    static let session = Color(.sRGB, red: 0.13, green: 0.62, blue: 0.27)
-    static let weekly  = Color(.sRGB, red: 0.35, green: 0.78, blue: 0.98)
-    static let sonnet  = Color(.sRGB, red: 1.00, green: 0.62, blue: 0.04)
+    static let session = Color(.sRGB, red: 0.13, green: 0.62, blue: 0.27)  // darker #219E45
+    static let weekly  = Color(.sRGB, red: 0.10, green: 0.48, blue: 0.75)  // darker #1A7ABF
+    static let model   = Color(.sRGB, red: 0.85, green: 0.50, blue: 0.02)  // darker #D98005
     static let alert   = Color(.sRGB, red: 1.00, green: 0.23, blue: 0.19)
 
     /// Linear sRGB interpolation between two NSColors.
@@ -634,7 +636,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         button.attributedTitle = menuBarTitle()
     }
 
-    /// Colored menu-bar text: session % (+optional bits), then weekly, then sonnet.
+    /// Colored menu-bar text: session % (+optional bits), then weekly, then per-model.
     /// Differentiated by color (no letter tags). Extras are behind Settings toggles.
     func menuBarTitle() -> NSAttributedString {
         let s = NSMutableAttributedString()
@@ -653,15 +655,15 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
             if um.showWeeklyTimer, let t = um.weeklyResetCountdown { parts.append(t) }
             if !parts.isEmpty { seg("  " + parts.joined(separator: " "), Palette.weeklyNS) }
         }
-        if um.showSonnetPercent, um.hasWeeklySonnet {
-            seg("  \(um.weeklySonnetUsage)%", Palette.sonnetNS)
-            // Sonnet reset timer only if it differs from the weekly reset by at least
-            // a minute (matches the minute-level display granularity; avoids a
+        if um.showModelPercent, let sw = um.scopedWeekly.first {
+            seg("  \(sw.percent)%", Palette.modelNS)
+            // Per-model reset timer only if it differs from the weekly reset by at
+            // least a minute (matches the minute-level display granularity; avoids a
             // redundant duplicate timer when they're effectively the same instant).
-            if let st = um.weeklySonnetResetsAt,
+            if let st = sw.resetsAt,
                um.weeklyResetsAt.map({ abs(st.timeIntervalSince($0)) >= 60 }) ?? true,
-               let t = um.sonnetResetCountdown {
-                seg(" \(t)", Palette.sonnetNS)
+               let t = UsageManager.countdown(to: st) {
+                seg(" \(t)", Palette.modelNS)
             }
         }
         return s
@@ -744,9 +746,20 @@ struct Main {
     }
 }
 
-/// The core model. Polls claude.ai's internal usage API (five_hour / seven_day /
-/// seven_day_sonnet), parses the utilization % and reset times, and publishes
-/// everything the popover and the menu-bar title render. Also owns:
+/// One per-model weekly window (a `weekly_scoped` entry of the June-2026 `limits`
+/// array, e.g. "Fable"). The display name comes from the API, so newly limited
+/// models appear without code changes.
+struct ScopedWeeklyLimit: Equatable, Identifiable {
+    let name: String
+    let percent: Int
+    let resetsAt: Date?
+    var id: String { name }
+}
+
+/// The core model. Polls claude.ai's internal usage API — primary source is the
+/// June-2026 `limits` array (session / weekly_all / per-model weekly_scoped), with
+/// the legacy five_hour / seven_day / seven_day_sonnet keys as fallback — and
+/// publishes everything the popover and the menu-bar title render. Also owns:
 ///   • the session cookie (loaded from / saved to the Keychain via KeychainHelper),
 ///   • all persisted settings (UserDefaults: refresh interval, menu-bar display
 ///     modes/thresholds, notification toggles, tracked-component selection),
@@ -759,10 +772,10 @@ class UsageManager: ObservableObject {
     // values ARE the percentage — no separate limit field is needed.
     @Published var sessionUsage: Int = 0
     @Published var weeklyUsage: Int = 0
-    @Published var weeklySonnetUsage: Int = 0
     @Published var sessionResetsAt: Date?
     @Published var weeklyResetsAt: Date?
-    @Published var weeklySonnetResetsAt: Date?
+    // Per-model weekly windows (e.g. Fable). Usually 0 or 1 entries today.
+    @Published var scopedWeekly: [ScopedWeeklyLimit] = []
     @Published var lastUpdated: Date = Date()
     @Published var isLoading: Bool = false
     @Published var errorMessage: String?
@@ -772,7 +785,6 @@ class UsageManager: ObservableObject {
     @Published var usageNotificationsEnabled: Bool = true
     @Published var statusNotificationsEnabled: Bool = true
     @Published var openAtLogin: Bool = false
-    @Published var hasWeeklySonnet: Bool = false
     @Published var hasFetchedData: Bool = false
     @Published var isAccessibilityEnabled: Bool = false
     @Published var shortcutEnabled: Bool = true
@@ -797,8 +809,10 @@ class UsageManager: ObservableObject {
     @Published var weeklyPercentThreshold: Int = 80     // percent
     @Published var weeklyTimerMode: BarMode = .off
     @Published var weeklyTimerThreshold: Int = 60       // minutes
-    @Published var sonnetPercentMode: BarMode = .off
-    @Published var sonnetPercentThreshold: Int = 80     // percent
+    // Per-model weekly % (UserDefaults keys keep the legacy "sonnet_*" names
+    // for settings compatibility with older builds).
+    @Published var modelPercentMode: BarMode = .off
+    @Published var modelPercentThreshold: Int = 80      // percent
     @Published var blinkEnabled: Bool = true
 
     private func minutesUntil(_ date: Date?) -> Int? {
@@ -824,12 +838,11 @@ class UsageManager: ObservableObject {
     var showSessionTimer: Bool { showTimer(mode: sessionTimerMode, date: sessionResetsAt, threshold: sessionTimerThreshold) }
     var showWeeklyPercent: Bool { showPercent(mode: weeklyPercentMode, value: weeklyUsage, threshold: weeklyPercentThreshold) }
     var showWeeklyTimer: Bool { showTimer(mode: weeklyTimerMode, date: weeklyResetsAt, threshold: weeklyTimerThreshold) }
-    var showSonnetPercent: Bool { showPercent(mode: sonnetPercentMode, value: weeklySonnetUsage, threshold: sonnetPercentThreshold) }
+    var showModelPercent: Bool { showPercent(mode: modelPercentMode, value: scopedWeekly.first?.percent ?? 0, threshold: modelPercentThreshold) }
 
     // Countdown to each window's reset (e.g. "1h59m", "2d17h", "<1m"); nil if unknown.
     var sessionResetCountdown: String? { UsageManager.countdown(to: sessionResetsAt) }
     var weeklyResetCountdown: String?  { UsageManager.countdown(to: weeklyResetsAt) }
-    var sonnetResetCountdown: String?  { UsageManager.countdown(to: weeklySonnetResetsAt) }
 
     static func countdown(to date: Date?) -> String? {
         guard let date = date else { return nil }
@@ -936,11 +949,11 @@ class UsageManager: ObservableObject {
         sessionTimerMode = BarMode(rawValue: d.integer(forKey: "session_timer_mode")) ?? .off
         weeklyPercentMode = BarMode(rawValue: d.integer(forKey: "weekly_percent_mode")) ?? .off
         weeklyTimerMode = BarMode(rawValue: d.integer(forKey: "weekly_timer_mode")) ?? .off
-        sonnetPercentMode = BarMode(rawValue: d.integer(forKey: "sonnet_percent_mode")) ?? .off
+        modelPercentMode = BarMode(rawValue: d.integer(forKey: "sonnet_percent_mode")) ?? .off
         if d.object(forKey: "session_timer_thr") != nil { sessionTimerThreshold = d.integer(forKey: "session_timer_thr") }
         if d.object(forKey: "weekly_percent_thr") != nil { weeklyPercentThreshold = d.integer(forKey: "weekly_percent_thr") }
         if d.object(forKey: "weekly_timer_thr")  != nil { weeklyTimerThreshold  = d.integer(forKey: "weekly_timer_thr") }
-        if d.object(forKey: "sonnet_percent_thr") != nil { sonnetPercentThreshold = d.integer(forKey: "sonnet_percent_thr") }
+        if d.object(forKey: "sonnet_percent_thr") != nil { modelPercentThreshold = d.integer(forKey: "sonnet_percent_thr") }
         blinkEnabled = d.object(forKey: "blink_enabled") == nil ? true : d.bool(forKey: "blink_enabled")
         // Default shortcut to enabled if not previously set
         if UserDefaults.standard.object(forKey: "shortcut_enabled") == nil {
@@ -959,11 +972,11 @@ class UsageManager: ObservableObject {
         d.set(sessionTimerMode.rawValue, forKey: "session_timer_mode")
         d.set(weeklyPercentMode.rawValue, forKey: "weekly_percent_mode")
         d.set(weeklyTimerMode.rawValue, forKey: "weekly_timer_mode")
-        d.set(sonnetPercentMode.rawValue, forKey: "sonnet_percent_mode")
+        d.set(modelPercentMode.rawValue, forKey: "sonnet_percent_mode")
         d.set(sessionTimerThreshold, forKey: "session_timer_thr")
         d.set(weeklyPercentThreshold, forKey: "weekly_percent_thr")
         d.set(weeklyTimerThreshold, forKey: "weekly_timer_thr")
-        d.set(sonnetPercentThreshold, forKey: "sonnet_percent_thr")
+        d.set(modelPercentThreshold, forKey: "sonnet_percent_thr")
         d.set(blinkEnabled, forKey: "blink_enabled")
     }
 
@@ -1032,12 +1045,10 @@ class UsageManager: ObservableObject {
         // Reset all data
         sessionUsage = 0
         weeklyUsage = 0
-        weeklySonnetUsage = 0
+        scopedWeekly = []
         sessionResetsAt = nil
         weeklyResetsAt = nil
-        weeklySonnetResetsAt = nil
         hasFetchedData = false
-        hasWeeklySonnet = false
         errorMessage = nil
         lastNotifiedThreshold = 0
         UserDefaults.standard.set(0, forKey: "last_notified_threshold")
@@ -1212,11 +1223,20 @@ class UsageManager: ObservableObject {
         }
     }
 
-    /// Parse one usage window (five_hour / seven_day / seven_day_sonnet): rounded
-    /// utilization percent + reset Date. Returns nil if the window key is absent.
-    /// resets_at is parsed with a fractional-seconds-first ISO8601 formatter and a
-    /// no-fractional fallback (mirrors StatusManager.parse), so both timestamp
-    /// shapes succeed. nil resetsAt means the field was missing/unparseable — the
+    /// Parse an ISO8601 timestamp, trying fractional seconds first with a
+    /// no-fractional fallback (mirrors StatusManager.parse), so both shapes succeed.
+    static func parseISODate(_ s: String) -> Date? {
+        let primary = ISO8601DateFormatter()
+        primary.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        if let d = primary.date(from: s) { return d }
+        let fallback = ISO8601DateFormatter()
+        fallback.formatOptions = [.withInternetDateTime]
+        return fallback.date(from: s)
+    }
+
+    /// Parse one legacy usage window (five_hour / seven_day / seven_day_sonnet):
+    /// rounded utilization percent + reset Date. Returns nil if the window key is
+    /// absent or null. nil resetsAt means the field was missing/unparseable — the
     /// caller keeps the previous value rather than clobbering it.
     private func parseWindow(_ key: String, in json: [String: Any]) -> (usage: Int, resetsAt: Date?)? {
         guard let dict = json[key] as? [String: Any] else { return nil }
@@ -1224,11 +1244,7 @@ class UsageManager: ObservableObject {
         let usage = (dict["utilization"] as? Double).map { Int($0.rounded()) } ?? 0
         var resetsAt: Date?
         if let s = dict["resets_at"] as? String {
-            let primary = ISO8601DateFormatter()
-            primary.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
-            let fallback = ISO8601DateFormatter()
-            fallback.formatOptions = [.withInternetDateTime]
-            resetsAt = primary.date(from: s) ?? fallback.date(from: s)
+            resetsAt = UsageManager.parseISODate(s)
             if resetsAt == nil { NSLog("❌ Failed to parse \(key) reset time: \(s)") }
         }
         return (usage, resetsAt)
@@ -1243,8 +1259,9 @@ class UsageManager: ObservableObject {
 
             NSLog("📊 Parsing usage data...")
 
-            // Parse each usage window via the shared helper (dedups the three
-            // identical blocks and centralizes the ISO8601 fractional-seconds fallback).
+            // Legacy top-level windows first (pre-June-2026 schema; five_hour and
+            // seven_day are still populated as of July 2026, seven_day_sonnet is
+            // null but kept as fallback for the old schema).
             if let w = parseWindow("five_hour", in: json) {
                 sessionUsage = w.usage
                 sessionResetsAt = w.resetsAt ?? sessionResetsAt
@@ -1253,17 +1270,43 @@ class UsageManager: ObservableObject {
                 weeklyUsage = w.usage
                 weeklyResetsAt = w.resetsAt ?? weeklyResetsAt
             }
-            // seven_day_sonnet is a Pro-plan feature; absent for other plans.
+            var scoped: [ScopedWeeklyLimit] = []
             if let w = parseWindow("seven_day_sonnet", in: json) {
-                hasWeeklySonnet = true
-                weeklySonnetUsage = w.usage
-                weeklySonnetResetsAt = w.resetsAt ?? weeklySonnetResetsAt
-            } else {
-                hasWeeklySonnet = false
+                scoped = [ScopedWeeklyLimit(name: "Sonnet", percent: w.usage, resetsAt: w.resetsAt)]
             }
 
+            // June-2026 `limits` array: authoritative when present. Carries the
+            // session/weekly windows plus per-model `weekly_scoped` entries whose
+            // display name comes from the API (e.g. "Fable").
+            if let limits = json["limits"] as? [[String: Any]], !limits.isEmpty {
+                var scopedFromLimits: [ScopedWeeklyLimit] = []
+                for entry in limits {
+                    guard let kind = entry["kind"] as? String else { continue }
+                    let percent = (entry["percent"] as? NSNumber).map { Int($0.doubleValue.rounded()) } ?? 0
+                    let resetsAt = (entry["resets_at"] as? String).flatMap(UsageManager.parseISODate)
+                    switch kind {
+                    case "session":
+                        sessionUsage = percent
+                        sessionResetsAt = resetsAt ?? sessionResetsAt
+                    case "weekly_all":
+                        weeklyUsage = percent
+                        weeklyResetsAt = resetsAt ?? weeklyResetsAt
+                    case "weekly_scoped":
+                        let model = ((entry["scope"] as? [String: Any])?["model"]) as? [String: Any]
+                        let name = (model?["display_name"] as? String) ?? "Model"
+                        scopedFromLimits.append(ScopedWeeklyLimit(name: name, percent: percent, resetsAt: resetsAt))
+                    default:
+                        break   // unknown future kinds are ignored
+                    }
+                }
+                // The array is the source of truth — replace even if it yielded
+                // no scoped entries (means there IS no per-model window anymore).
+                scoped = scopedFromLimits
+            }
+            scopedWeekly = scoped
+
             // Log what we found
-            NSLog("✅ Parsed: Session \(sessionUsage)%, Weekly \(weeklyUsage)%\(hasWeeklySonnet ? ", Weekly Sonnet \(weeklySonnetUsage)%" : "")")
+            NSLog("✅ Parsed: Session \(sessionUsage)%, Weekly \(weeklyUsage)%\(scopedWeekly.map { ", \($0.name) \($0.percent)%" }.joined())")
 
             lastUpdated = Date()
             lastSuccessfulUpdate = Date()
@@ -1308,14 +1351,14 @@ class UsageManager: ObservableObject {
 
         let thresholds = [25, 50, 75, 90]
 
-        for threshold in thresholds {
-            if percentage >= threshold && lastNotifiedThreshold < threshold {
-                NSLog("📬 Sending notification for \(threshold)% threshold")
-                sendNotification(percentage: percentage, threshold: threshold)
-                lastNotifiedThreshold = threshold
-                // Persist the threshold
-                UserDefaults.standard.set(lastNotifiedThreshold, forKey: "last_notified_threshold")
-            }
+        // Notify only the HIGHEST newly-crossed threshold, once — a jump from
+        // e.g. 20%→80% fires a single 75% alert, not a 25/50/75 burst.
+        if let crossed = thresholds.filter({ percentage >= $0 && lastNotifiedThreshold < $0 }).max() {
+            NSLog("📬 Sending notification for \(crossed)% threshold")
+            sendNotification(percentage: percentage, threshold: crossed)
+            lastNotifiedThreshold = crossed
+            // Persist the threshold
+            UserDefaults.standard.set(lastNotifiedThreshold, forKey: "last_notified_threshold")
         }
 
         // Re-arm: keep lastNotifiedThreshold == the highest threshold currently
@@ -1377,13 +1420,16 @@ class UsageManager: ObservableObject {
 
     @Published var sessionPercentage: Double = 0.0
     @Published var weeklyPercentage: Double = 0.0
-    @Published var weeklySonnetPercentage: Double = 0.0
+
+    /// Percent (0–100) → clamped 0–1 fraction for ProgressView (the API can
+    /// report slightly over 100 at the cap edge; >1 trips a runtime warning).
+    static func fraction(_ percent: Int) -> Double {
+        min(max(Double(percent) / 100.0, 0), 1)
+    }
 
     func updatePercentages() {
-        // Utilization values are percents (0–100); ProgressView wants a 0–1 fraction.
-        sessionPercentage = Double(sessionUsage) / 100.0
-        weeklyPercentage = Double(weeklyUsage) / 100.0
-        weeklySonnetPercentage = Double(weeklySonnetUsage) / 100.0
+        sessionPercentage = UsageManager.fraction(sessionUsage)
+        weeklyPercentage = UsageManager.fraction(weeklyUsage)
     }
 }
 
@@ -1887,12 +1933,13 @@ struct UsageView: View {
                          color: Palette.weekly,
                          includeDate: true)
 
-                if usageManager.hasWeeklySonnet {
-                    usageRow(title: "Weekly Sonnet (7 day)",
-                             percentage: usageManager.weeklySonnetPercentage,
-                             resetDate: usageManager.weeklySonnetResetsAt,
-                             countdown: usageManager.sonnetResetCountdown,
-                             color: Palette.sonnet,
+                // Per-model weekly windows (e.g. Fable), named by the API.
+                ForEach(usageManager.scopedWeekly) { sw in
+                    usageRow(title: "Weekly \(sw.name) (7 day)",
+                             percentage: UsageManager.fraction(sw.percent),
+                             resetDate: sw.resetsAt,
+                             countdown: UsageManager.countdown(to: sw.resetsAt),
+                             color: Palette.model,
                              includeDate: true)
                 }
             }
@@ -2237,9 +2284,9 @@ struct UsageView: View {
                         barRow("Weekly reset timer", Palette.weekly, isPercent: false,
                                modeGet: { usageManager.weeklyTimerMode }, modeSet: { usageManager.weeklyTimerMode = $0 },
                                thrGet: { usageManager.weeklyTimerThreshold }, thrSet: { usageManager.weeklyTimerThreshold = $0 })
-                        barRow("Weekly Sonnet usage %", Palette.sonnet, isPercent: true,
-                               modeGet: { usageManager.sonnetPercentMode }, modeSet: { usageManager.sonnetPercentMode = $0 },
-                               thrGet: { usageManager.sonnetPercentThreshold }, thrSet: { usageManager.sonnetPercentThreshold = $0 })
+                        barRow("Weekly \(usageManager.scopedWeekly.first?.name ?? "model") usage %", Palette.model, isPercent: true,
+                               modeGet: { usageManager.modelPercentMode }, modeSet: { usageManager.modelPercentMode = $0 },
+                               thrGet: { usageManager.modelPercentThreshold }, thrSet: { usageManager.modelPercentThreshold = $0 })
                         Toggle(isOn: Binding(
                             get: { usageManager.blinkEnabled },
                             set: { usageManager.blinkEnabled = $0; usageManager.applyMenuBarSettings() }
