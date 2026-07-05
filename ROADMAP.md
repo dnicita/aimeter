@@ -7,7 +7,8 @@ App: **AIMeter** · bundle id `com.danielenicita.aimeter` · Keychain service id
 ## Build & install
 - `cd app && ./build-local.sh --install` → compila universale, firma con cert stabile, installa in /Applications, lancia.
 - Firma stabile: `app/create_signing_cert.sh` (già eseguito una volta; identità keychain "ClaudeUsageBar Local").
-- Versioning: `CFBundleVersion` (build number) auto-incrementa ad ogni build; `CFBundleShortVersionString` = `1.3.0-fork` (semver, bump a mano per release). Versione visibile nel footer del popover.
+- Versioning: `CFBundleVersion` (build number) auto-incrementa ad ogni build; `CFBundleShortVersionString` = `1.4.0-fork` (semver, bump a mano per release). Versione visibile nel footer del popover.
+- Repo pubblico: https://github.com/dnicita/aimeter (true fork di Artzainnn/ClaudeUsageBar; vecchio privato in `aimeter-private-bak`).
 
 ## ✅ Fatto (build 13)
 - **Login al boot reale**: era un toggle finto (scriveva solo un bool). Ora LaunchAgent in `~/Library/LaunchAgents/com.claude.usagebar.plist` (SMAppService era inaffidabile con firma ad-hoc).
@@ -25,11 +26,17 @@ App: **AIMeter** · bundle id `com.danielenicita.aimeter` · Keychain service id
 - **Rebrand AIMeter (build 18, FATTO)**: nome + bundle id + icona "meter". Migrazione automatica del cookie dal vecchio Keychain (`com.claude.usagebar`) e del LaunchAgent; vecchia app + agent rimossi. Vedi `KeychainHelper.legacyService`, `LoginItemManager.migrateFromLegacy()`. Check aggiornamenti disabilitato.
 - Backup build 13 in `backups/v1.3.0-fork-build13-20260623/`.
 - Nota minore: l'header del popover dice ancora "Claude Usage" (descrittivo, uso nominativo — lasciato apposta).
+- **Fork pubblico (2026-06)**: repo pubblicato come true fork `dnicita/aimeter` (badge "forked from"), storia verificata senza segreti, credit a Claude Code nel README. Chiude #10.
+- **Popover stabile (build 30)**: mai ridimensionare l'NSPopover mentre è visibile (salto a x=0 / taglio in alto); dimensione fissata solo prima di `show()`, contenuto più alto scrolla. Colori barra/popover disaccoppiati (barra luminosi, popover scuri).
+- **API giugno 2026 → array `limits` (build 32)**: Anthropic ha spostato le quote per-modello da `seven_day_<model>` (ora null per sempre) al nuovo array `limits` (`session`/`weekly_all`/`weekly_scoped` + `scope.model.display_name`). Ora `limits` è la fonte autoritativa (legacy come fallback), riga per-modello generica con nome dinamico dall'API (oggi "Fable"), chiavi UserDefaults `sonnet_*` mantenute per compat. Extra: notifica solo della soglia più alta superata (niente raffiche), clamp % >100, escaping XML nel LaunchAgent, rimosso WebKit inutilizzato. Nota probe: curl è bloccato da Cloudflare sull'API, usare URLSession.
 
 ## ❌ Abbandonato — Monitorare credito API in dollari
 Tentato (build 19) con WKWebView embedded + intercettazione XHR della pagina Billing del Console (per evitare di indovinare l'endpoint). **Bloccato**: l'account usa **login Google**, e Google **rifiuta l'OAuth nei browser embedded** ("Si è verificato un errore durante l'accesso"). Niente workaround affidabile (Safari protegge i cookie; spoof UA non basta). Anche il cookie di claude.ai NON autentica il Console (302→login) e claude.ai blocca curl (Cloudflare; l'app però passa). Unica via residua: cattura manuale cookie+endpoint del Console dal browser normale (manuale + da rifare a scadenza). Vista l'utenza quasi solo Max (crediti API ~fermi), **non vale la pena**. Codice rimosso in build 20.
 
 ## 📋 Da fare (prossima sessione)
 
-### #10 — Verificare fork "legale"
-Codice MIT → fork/modifica/ridistribuzione OK mantenendo LICENSE + copyright. Caveat: marchio/logo "Claude" (Anthropic) non coperto da MIT; uso API interna + cookie è zona grigia ToS. Per uso personale: nessun problema. Per distribuzione pubblica: rinominare/rebrand + disclaimer "non affiliato". Se si pubblica: preparare README di fork con attribuzioni MIT.
+- (idea, non richiesto) Notifiche a soglia anche per Weekly e finestre per-modello (oggi solo Session); eventualmente blink esteso. Daniele per ora ha detto che va bene così.
+- (deferito da Daniele) Trust del cert self-signed (`security add-trusted-cert -r trustRoot -p codeSign`) per eliminare il prompt password al primo avvio dopo una build.
+
+### ✅ #10 — Verificare fork "legale" (CHIUSO)
+Codice MIT → fork/modifica/ridistribuzione OK mantenendo LICENSE + copyright. Caveat: marchio/logo "Claude" (Anthropic) non coperto da MIT; uso API interna + cookie è zona grigia ToS. Fatto: rebrand AIMeter, fork pubblico con LICENSE/attribuzioni mantenute.
