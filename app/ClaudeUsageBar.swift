@@ -237,14 +237,25 @@ enum LoginItemManager {
 // Session=green, Weekly=blue, per-model weekly (e.g. Fable)=orange. Red = alarm.
 // Menu-bar colors stay bright (translucent backdrop); popover colors run darker.
 enum Palette {
-    // Menu-bar colors: kept bright/luminous so they stay legible over the
-    // translucent menu bar (which sits on the desktop wallpaper). The popover
-    // variants below are darker on purpose — they sit on an opaque background.
-    static let sessionNS = NSColor(srgbRed: 0.18, green: 0.82, blue: 0.35, alpha: 1) // #30D158 system green
-    static let weeklyNS  = NSColor(srgbRed: 0.35, green: 0.78, blue: 0.98, alpha: 1) // #5AC8FA bright sky blue
-    static let modelNS   = NSColor(srgbRed: 1.00, green: 0.62, blue: 0.04, alpha: 1) // #FF9F0A
-    static let alertNS   = NSColor(srgbRed: 1.00, green: 0.23, blue: 0.19, alpha: 1) // red
-    static let warnNS    = NSColor(srgbRed: 1.00, green: 0.80, blue: 0.00, alpha: 1) // yellow
+    // Menu-bar colors: DYNAMIC — the menu bar can be dark (dark mode / dark
+    // wallpaper tint) or light (light mode). Bright variants read well on dark
+    // but wash out on light, so each resolves per-appearance. The bitmap icon
+    // bakes them via the status button's effectiveAppearance (see drawIcon).
+    private static func dyn(light: NSColor, dark: NSColor) -> NSColor {
+        NSColor(name: nil) { appearance in
+            appearance.bestMatch(from: [.aqua, .darkAqua]) == .darkAqua ? dark : light
+        }
+    }
+    static let sessionNS = dyn(light: NSColor(srgbRed: 0.11, green: 0.55, blue: 0.24, alpha: 1),  // #1C8C3D
+                               dark:  NSColor(srgbRed: 0.18, green: 0.82, blue: 0.35, alpha: 1))  // #30D158
+    static let weeklyNS  = dyn(light: NSColor(srgbRed: 0.05, green: 0.42, blue: 0.68, alpha: 1),  // #0D6BAD
+                               dark:  NSColor(srgbRed: 0.35, green: 0.78, blue: 0.98, alpha: 1))  // #5AC8FA
+    static let modelNS   = dyn(light: NSColor(srgbRed: 0.72, green: 0.40, blue: 0.00, alpha: 1),  // #B86600
+                               dark:  NSColor(srgbRed: 1.00, green: 0.62, blue: 0.04, alpha: 1))  // #FF9F0A
+    static let alertNS   = dyn(light: NSColor(srgbRed: 0.84, green: 0.00, blue: 0.08, alpha: 1),  // #D60014
+                               dark:  NSColor(srgbRed: 1.00, green: 0.23, blue: 0.19, alpha: 1))  // #FF3B30
+    static let warnNS    = dyn(light: NSColor(srgbRed: 0.80, green: 0.60, blue: 0.00, alpha: 1),  // #CC9900
+                               dark:  NSColor(srgbRed: 1.00, green: 0.80, blue: 0.00, alpha: 1))  // #FFCC00
 
     static let session = Color(.sRGB, red: 0.13, green: 0.62, blue: 0.27)  // darker #219E45
     static let weekly  = Color(.sRGB, red: 0.10, green: 0.48, blue: 0.75)  // darker #1A7ABF
@@ -293,6 +304,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
     var blinkTick: Int = 0
     var ringBlinkOn: Bool = true     // blink phase of the session ring (low-quota alarm)
     var statusBlinkOn: Bool = true   // blink phase of the center status dot (outage)
+    var appearanceObservation: NSKeyValueObservation?  // menu bar light/dark flips
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         // NSUserNotification (deprecated but works without permissions for unsigned apps)
@@ -314,6 +326,12 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
             // Force the button to be visible
             button.appearsDisabled = false
             button.isEnabled = true
+
+            // The ring icon is a baked bitmap: re-render it when the menu bar
+            // flips light/dark (the title's dynamic colors update on their own).
+            appearanceObservation = button.observe(\.effectiveAppearance) { [weak self] _, _ in
+                DispatchQueue.main.async { MainActor.assumeIsolated { self?.drawIcon() } }
+            }
         }
 
         // Initialize managers
@@ -629,10 +647,15 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         let dot = statusDotColor()
         let drawDot = dot != nil && !(blinkEnabled && !statusBlinkOn)
 
-        button.image = createRingIcon(percentage: percent,
-                                      color: sessionRingColor(percent),
-                                      drawRing: drawRing,
-                                      dotColor: drawDot ? dot : nil)
+        // The icon is a baked bitmap, so dynamic Palette colors must be resolved
+        // here against the menu bar's actual appearance (light vs dark). The
+        // attributed title keeps the dynamic colors and resolves at draw time.
+        button.effectiveAppearance.performAsCurrentDrawingAppearance {
+            button.image = createRingIcon(percentage: percent,
+                                          color: sessionRingColor(percent),
+                                          drawRing: drawRing,
+                                          dotColor: drawDot ? dot : nil)
+        }
         button.attributedTitle = menuBarTitle()
     }
 
@@ -1013,6 +1036,58 @@ class UsageManager: ObservableObject {
         delegate?.setPopoverHeight(h)
     }
 
+    /// Credential keep-fresh, same idea as QobuzGame's `_refresh_token`: use the
+    /// current credential to stay authenticated forever. claude.ai has no explicit
+    /// refresh endpoint, but like any web app it can rotate/extend session cookies
+    /// via Set-Cookie on ordinary API responses — browsers adopt them silently,
+    /// which is why the browser session outlives our pasted snapshot. Extracts the
+    /// rotated cookies from a 200 response (background thread, Sendable tuples).
+    nonisolated static func extractCookieUpdates(_ response: URLResponse?) -> [(name: String, value: String)] {
+        guard let http = response as? HTTPURLResponse,
+              http.statusCode == 200,
+              let fields = http.allHeaderFields as? [String: String],
+              let url = http.url else { return [] }
+        return HTTPCookie.cookies(withResponseHeaderFields: fields, for: url)
+            .filter { !$0.value.isEmpty && ($0.expiresDate.map { $0 > Date() } ?? true) }
+            .map { ($0.name, $0.value) }
+    }
+
+    /// Merge rotated cookies into the stored cookie string and re-persist to the
+    /// Keychain. Conservative on purpose: only updates names ALREADY in the stored
+    /// string (no new cookies appended, none deleted), so a server blip can never
+    /// grow, churn, or wipe the credential — a dead sessionKey still surfaces
+    /// through the normal 401/403 path.
+    func absorbSetCookies(_ updates: [(name: String, value: String)]) {
+        guard !updates.isEmpty, !sessionCookie.isEmpty else { return }
+
+        var order: [String] = []
+        var values: [String: String] = [:]
+        for part in sessionCookie.components(separatedBy: ";") {
+            let t = part.trimmingCharacters(in: .whitespaces)
+            guard let eq = t.firstIndex(of: "="), eq != t.startIndex else { continue }
+            let name = String(t[..<eq])
+            guard values[name] == nil else { continue }   // keep first on dup
+            order.append(name)
+            values[name] = String(t[t.index(after: eq)...])
+        }
+
+        var changedNames: [String] = []
+        for u in updates where values[u.name] != nil && values[u.name] != u.value {
+            values[u.name] = u.value
+            changedNames.append(u.name)
+        }
+        guard !changedNames.isEmpty else { return }
+
+        sessionCookie = order.compactMap { n in values[n].map { "\(n)=\($0)" } }
+            .joined(separator: "; ")
+        if KeychainHelper.save(sessionCookie) {
+            // Names only — cookie VALUES must never reach the log.
+            NSLog("🔐 Rotated cookies persisted: \(changedNames.joined(separator: ", "))")
+        } else {
+            NSLog("🔐 ⚠️ Keychain save failed for rotated cookies")
+        }
+    }
+
     func saveSessionCookie(_ cookie: String) {
         // Trim sloppy-paste whitespace/newlines and reject control characters
         // (cheap defense-in-depth against CRLF header injection on the Cookie header).
@@ -1095,6 +1170,7 @@ class UsageManager: ObservableObject {
                 }
                 return
             }
+            let rotated = UsageManager.extractCookieUpdates(response)
             guard let data = data,
                   let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
                   let account = json["account"] as? [String: Any],
@@ -1104,7 +1180,10 @@ class UsageManager: ObservableObject {
                 return
             }
             vlog("✅ Got org ID from bootstrap: \(lastActiveOrgId)")
-            Task { @MainActor in completion(lastActiveOrgId) }
+            Task { @MainActor in
+                self?.absorbSetCookies(rotated)
+                completion(lastActiveOrgId)
+            }
         }.resume()
     }
 
@@ -1169,6 +1248,7 @@ class UsageManager: ObservableObject {
         URLSession.shared.dataTask(with: request) { [weak self] data, response, error in
             // Reduce to Sendable values before hopping to the main actor.
             let status = (response as? HTTPURLResponse)?.statusCode
+            let rotated = UsageManager.extractCookieUpdates(response)   // 200-only inside
             let hadError = error != nil
             let errorDesc = error?.localizedDescription
             Task { @MainActor in
@@ -1197,6 +1277,7 @@ class UsageManager: ObservableObject {
 
                 if status == 200, let data = data {
                     self.cookieInvalid = false
+                    self.absorbSetCookies(rotated)
                     self.parseUsageData(data)
                     // Only refresh the icon + run threshold notifications on fresh data.
                     self.updateStatusBar()
