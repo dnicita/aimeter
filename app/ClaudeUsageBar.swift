@@ -297,6 +297,8 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
     var usageTimer: Timer?
     // Last measured SwiftUI content height; used to size the popover before each show.
     var lastPopoverHeight: CGFloat = 360
+    // Opaque backdrop slipped under the popover content (see openPopover).
+    var popoverOpaqueBG: NSView?
     // Menu-bar icon / blink state
     var lastSessionPercent: Int = 0
     var blinkTimer: Timer?           // 0.1s master tick, runs only while blinking
@@ -522,6 +524,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
             popover.contentSize = NSSize(width: AppDelegate.popoverWidth,
                                          height: clampedPopoverHeight(lastPopoverHeight))
             popover.show(relativeTo: button.bounds, of: button, preferredEdge: .minY)
+            installOpaquePopoverBackground()
 
             // Tear down any stale monitor before adding a fresh one (a transient
             // auto-dismiss may not have routed through closePopover).
@@ -537,6 +540,32 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
     func closePopover() {
         popover.performClose(nil)
         removeEventMonitor()
+    }
+
+    /// NSPopover's default vibrant material lets whatever sits behind bleed
+    /// through — over a dark/busy window the content becomes unreadable. Slip an
+    /// opaque window-background view UNDER the content, inside the popover's
+    /// frame view: the frame's layer mask keeps rounded corners + arrow shape.
+    /// Runs after every show() because AppKit can recreate the popover window
+    /// (a stale view would silently bring the transparency back); the color is
+    /// re-resolved each time so a light/dark theme switch is picked up too.
+    func installOpaquePopoverBackground() {
+        guard let contentView = popover.contentViewController?.view,
+              let frameView = contentView.superview else { return }
+        let bg: NSView
+        if let existing = popoverOpaqueBG, existing.superview === frameView {
+            bg = existing
+        } else {
+            popoverOpaqueBG?.removeFromSuperview()
+            bg = NSView(frame: frameView.bounds)
+            bg.wantsLayer = true
+            bg.autoresizingMask = [.width, .height]
+            frameView.addSubview(bg, positioned: .below, relativeTo: contentView)
+            popoverOpaqueBG = bg
+        }
+        frameView.effectiveAppearance.performAsCurrentDrawingAppearance {
+            bg.layer?.backgroundColor = NSColor.windowBackgroundColor.cgColor
+        }
     }
 
     private func removeEventMonitor() {
@@ -678,16 +707,12 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
             if um.showWeeklyTimer, let t = um.weeklyResetCountdown { parts.append(t) }
             if !parts.isEmpty { seg("  " + parts.joined(separator: " "), Palette.weeklyNS) }
         }
-        if um.showModelPercent, let sw = um.scopedWeekly.first {
-            seg("  \(sw.percent)%", Palette.modelNS)
-            // Per-model reset timer only if it differs from the weekly reset by at
-            // least a minute (matches the minute-level display granularity; avoids a
-            // redundant duplicate timer when they're effectively the same instant).
-            if let st = sw.resetsAt,
-               um.weeklyResetsAt.map({ abs(st.timeIntervalSince($0)) >= 60 }) ?? true,
-               let t = UsageManager.countdown(to: st) {
-                seg(" \(t)", Palette.modelNS)
-            }
+        // Per-model window: % and timer are independent toggles, same as Weekly.
+        if let sw = um.scopedWeekly.first, um.showModelPercent || um.showModelTimer {
+            var parts: [String] = []
+            if um.showModelPercent { parts.append("\(sw.percent)%") }
+            if um.showModelTimer, let t = UsageManager.countdown(to: sw.resetsAt) { parts.append(t) }
+            if !parts.isEmpty { seg("  " + parts.joined(separator: " "), Palette.modelNS) }
         }
         return s
     }
@@ -836,6 +861,8 @@ class UsageManager: ObservableObject {
     // for settings compatibility with older builds).
     @Published var modelPercentMode: BarMode = .off
     @Published var modelPercentThreshold: Int = 80      // percent
+    @Published var modelTimerMode: BarMode = .off
+    @Published var modelTimerThreshold: Int = 60        // minutes
     @Published var blinkEnabled: Bool = true
 
     private func minutesUntil(_ date: Date?) -> Int? {
@@ -862,6 +889,7 @@ class UsageManager: ObservableObject {
     var showWeeklyPercent: Bool { showPercent(mode: weeklyPercentMode, value: weeklyUsage, threshold: weeklyPercentThreshold) }
     var showWeeklyTimer: Bool { showTimer(mode: weeklyTimerMode, date: weeklyResetsAt, threshold: weeklyTimerThreshold) }
     var showModelPercent: Bool { showPercent(mode: modelPercentMode, value: scopedWeekly.first?.percent ?? 0, threshold: modelPercentThreshold) }
+    var showModelTimer: Bool { showTimer(mode: modelTimerMode, date: scopedWeekly.first?.resetsAt, threshold: modelTimerThreshold) }
 
     // Countdown to each window's reset (e.g. "1h59m", "2d17h", "<1m"); nil if unknown.
     var sessionResetCountdown: String? { UsageManager.countdown(to: sessionResetsAt) }
@@ -973,10 +1001,12 @@ class UsageManager: ObservableObject {
         weeklyPercentMode = BarMode(rawValue: d.integer(forKey: "weekly_percent_mode")) ?? .off
         weeklyTimerMode = BarMode(rawValue: d.integer(forKey: "weekly_timer_mode")) ?? .off
         modelPercentMode = BarMode(rawValue: d.integer(forKey: "sonnet_percent_mode")) ?? .off
+        modelTimerMode = BarMode(rawValue: d.integer(forKey: "model_timer_mode")) ?? .off
         if d.object(forKey: "session_timer_thr") != nil { sessionTimerThreshold = d.integer(forKey: "session_timer_thr") }
         if d.object(forKey: "weekly_percent_thr") != nil { weeklyPercentThreshold = d.integer(forKey: "weekly_percent_thr") }
         if d.object(forKey: "weekly_timer_thr")  != nil { weeklyTimerThreshold  = d.integer(forKey: "weekly_timer_thr") }
         if d.object(forKey: "sonnet_percent_thr") != nil { modelPercentThreshold = d.integer(forKey: "sonnet_percent_thr") }
+        if d.object(forKey: "model_timer_thr") != nil { modelTimerThreshold = d.integer(forKey: "model_timer_thr") }
         blinkEnabled = d.object(forKey: "blink_enabled") == nil ? true : d.bool(forKey: "blink_enabled")
         // Default shortcut to enabled if not previously set
         if UserDefaults.standard.object(forKey: "shortcut_enabled") == nil {
@@ -996,10 +1026,12 @@ class UsageManager: ObservableObject {
         d.set(weeklyPercentMode.rawValue, forKey: "weekly_percent_mode")
         d.set(weeklyTimerMode.rawValue, forKey: "weekly_timer_mode")
         d.set(modelPercentMode.rawValue, forKey: "sonnet_percent_mode")
+        d.set(modelTimerMode.rawValue, forKey: "model_timer_mode")
         d.set(sessionTimerThreshold, forKey: "session_timer_thr")
         d.set(weeklyPercentThreshold, forKey: "weekly_percent_thr")
         d.set(weeklyTimerThreshold, forKey: "weekly_timer_thr")
         d.set(modelPercentThreshold, forKey: "sonnet_percent_thr")
+        d.set(modelTimerThreshold, forKey: "model_timer_thr")
         d.set(blinkEnabled, forKey: "blink_enabled")
     }
 
@@ -2368,6 +2400,9 @@ struct UsageView: View {
                         barRow("Weekly \(usageManager.scopedWeekly.first?.name ?? "model") usage %", Palette.model, isPercent: true,
                                modeGet: { usageManager.modelPercentMode }, modeSet: { usageManager.modelPercentMode = $0 },
                                thrGet: { usageManager.modelPercentThreshold }, thrSet: { usageManager.modelPercentThreshold = $0 })
+                        barRow("Weekly \(usageManager.scopedWeekly.first?.name ?? "model") reset timer", Palette.model, isPercent: false,
+                               modeGet: { usageManager.modelTimerMode }, modeSet: { usageManager.modelTimerMode = $0 },
+                               thrGet: { usageManager.modelTimerThreshold }, thrSet: { usageManager.modelTimerThreshold = $0 })
                         Toggle(isOn: Binding(
                             get: { usageManager.blinkEnabled },
                             set: { usageManager.blinkEnabled = $0; usageManager.applyMenuBarSettings() }
