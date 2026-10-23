@@ -10,6 +10,12 @@ cd "$(dirname "$0")"
 
 APP="AIMeter"                 # bundle / executable name
 SRC="ClaudeUsageBar.swift"    # single source file (name kept)
+# Command Line Tools 27.0 ship a macOS 27 SDK where SwiftUI's @State is a macro,
+# but not the SwiftUIMacros plugin that expands it → every @State fails to compile.
+# Pin the last SDK that works (26.5) while it is still on disk; fall back to the
+# default otherwise.
+SDK_PINNED="/Library/Developer/CommandLineTools/SDKs/MacOSX26.5.sdk"
+if [ -d "$SDK_PINNED" ]; then SDK_FLAGS=(-sdk "$SDK_PINNED"); else SDK_FLAGS=(); fi
 ICNS="AIMeter.icns"
 APP_NAME="$APP.app"
 APP_PATH="build/$APP_NAME"
@@ -39,14 +45,20 @@ FRAMEWORKS=(-framework SwiftUI -framework AppKit)
 
 echo "  • arm64…"
 swiftc -parse-as-library -O -o "$APP_PATH/Contents/MacOS/${APP}_arm64" \
-    "$SRC" "${FRAMEWORKS[@]}" -target arm64-apple-macos12.0
+    "$SRC" "${FRAMEWORKS[@]}" "${SDK_FLAGS[@]}" -target arm64-apple-macos12.0
 echo "  • x86_64…"
-swiftc -parse-as-library -O -o "$APP_PATH/Contents/MacOS/${APP}_x86_64" \
-    "$SRC" "${FRAMEWORKS[@]}" -target x86_64-apple-macos12.0
-
-lipo -create -output "$APP_PATH/Contents/MacOS/$APP" \
-    "$APP_PATH/Contents/MacOS/${APP}_arm64" "$APP_PATH/Contents/MacOS/${APP}_x86_64"
-rm "$APP_PATH/Contents/MacOS/${APP}_arm64" "$APP_PATH/Contents/MacOS/${APP}_x86_64"
+# Optional since CLT 27.0: its Swift static libs (libswiftCompatibility56.a…) no
+# longer carry an x86_64 slice, so the Intel link fails. Ship arm64-only then.
+if swiftc -parse-as-library -O -o "$APP_PATH/Contents/MacOS/${APP}_x86_64" \
+    "$SRC" "${FRAMEWORKS[@]}" "${SDK_FLAGS[@]}" -target x86_64-apple-macos12.0 2>/dev/null; then
+    lipo -create -output "$APP_PATH/Contents/MacOS/$APP" \
+        "$APP_PATH/Contents/MacOS/${APP}_arm64" "$APP_PATH/Contents/MacOS/${APP}_x86_64"
+    rm "$APP_PATH/Contents/MacOS/${APP}_arm64" "$APP_PATH/Contents/MacOS/${APP}_x86_64"
+else
+    echo "  ⚠️  x86_64 link failed (toolchain lacks Intel slices) → arm64-only build"
+    mv "$APP_PATH/Contents/MacOS/${APP}_arm64" "$APP_PATH/Contents/MacOS/$APP"
+    rm -f "$APP_PATH/Contents/MacOS/${APP}_x86_64"
+fi
 
 echo -n "APPL????" > "$APP_PATH/Contents/PkgInfo"
 chmod 755 "$APP_PATH/Contents/MacOS/$APP"

@@ -67,9 +67,10 @@ enum KeychainHelper {
     static let service = "com.danielenicita.aimeter"
     static let legacyService = "com.claude.usagebar"   // pre-rebrand, for cookie migration
     static let account = "claude_session_cookie"
+    static let consoleAccount = "console_session_cookie"   // platform.claude.com session (fork)
 
     @discardableResult
-    static func save(_ value: String) -> Bool {
+    static func save(_ value: String, account: String = account) -> Bool {
         guard let data = value.data(using: .utf8) else { return false }
         // Delete any existing item first, then add fresh.
         let query: [String: Any] = [
@@ -89,7 +90,7 @@ enum KeychainHelper {
         return status == errSecSuccess
     }
 
-    static func load(from svc: String = service) -> String? {
+    static func load(from svc: String = service, account: String = account) -> String? {
         let query: [String: Any] = [
             kSecClass as String: kSecClassGenericPassword,
             kSecAttrService as String: svc,
@@ -104,7 +105,7 @@ enum KeychainHelper {
     }
 
     @discardableResult
-    static func delete() -> Bool {
+    static func delete(account: String = account) -> Bool {
         let query: [String: Any] = [
             kSecClass as String: kSecClassGenericPassword,
             kSecAttrService as String: service,
@@ -256,10 +257,16 @@ enum Palette {
                                dark:  NSColor(srgbRed: 1.00, green: 0.23, blue: 0.19, alpha: 1))  // #FF3B30
     static let warnNS    = dyn(light: NSColor(srgbRed: 0.80, green: 0.60, blue: 0.00, alpha: 1),  // #CC9900
                                dark:  NSColor(srgbRed: 1.00, green: 0.80, blue: 0.00, alpha: 1))  // #FFCC00
+    static let creditsNS = dyn(light: NSColor(srgbRed: 0.43, green: 0.25, blue: 0.76, alpha: 1),  // #6E3FC2
+                               dark:  NSColor(srgbRed: 0.75, green: 0.35, blue: 0.95, alpha: 1))  // #BF5AF2
+    static let consoleNS = dyn(light: NSColor(srgbRed: 0.04, green: 0.56, blue: 0.43, alpha: 1),  // #0A8F6E
+                               dark:  NSColor(srgbRed: 0.39, green: 0.90, blue: 0.75, alpha: 1))  // #63E6BE
 
     static let session = Color(.sRGB, red: 0.13, green: 0.62, blue: 0.27)  // darker #219E45
     static let weekly  = Color(.sRGB, red: 0.10, green: 0.48, blue: 0.75)  // darker #1A7ABF
     static let model   = Color(.sRGB, red: 0.85, green: 0.50, blue: 0.02)  // darker #D98005
+    static let credits = Color(.sRGB, red: 0.55, green: 0.31, blue: 0.85)  // darker #8C4FD9
+    static let console = Color(.sRGB, red: 0.06, green: 0.61, blue: 0.47)  // darker #0F9B78
     static let alert   = Color(.sRGB, red: 1.00, green: 0.23, blue: 0.19)
 
     /// Linear sRGB interpolation between two NSColors.
@@ -714,6 +721,9 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
             if um.showModelTimer, let t = UsageManager.countdown(to: sw.resetsAt) { parts.append(t) }
             if !parts.isEmpty { seg("  " + parts.joined(separator: " "), Palette.modelNS) }
         }
+        // Money balances: Max extra-usage credits, Console API credits.
+        if um.showExtraCredits, let t = um.extraCreditsText { seg("  " + t, Palette.creditsNS) }
+        if um.showConsoleCredits, let t = um.consoleCreditsText { seg("  " + t, Palette.consoleNS) }
         return s
     }
 
@@ -814,6 +824,17 @@ struct ScopedWeeklyLimit: Equatable, Identifiable {
 ///   • usage notifications (per-threshold, session-reset, reset-imminent),
 ///   • the conditional menu-bar visibility logic (show* computed properties).
 /// Network callbacks marshal back to the main thread before mutating @Published state.
+/// One prepaid-credit tranche as the Console reports it (purchased or promotional).
+/// Kept per tranche so the export can show exactly how much promo is left and when
+/// it expires — a single sum would hide that.
+struct CreditTranche: Equatable {
+    let name: String
+    let remainingMinor: Int
+    let grantedMinor: Int
+    let expiresAt: Date?
+    let scope: String?      // nil/unscoped = any model/product
+}
+
 @MainActor
 class UsageManager: ObservableObject {
     // The API reports each window's utilization as a percent (0–100), so these
@@ -865,6 +886,29 @@ class UsageManager: ObservableObject {
     @Published var modelTimerThreshold: Int = 60        // minutes
     @Published var blinkEnabled: Bool = true
 
+    // API prepaid credit balance from the Console (platform.claude.com), fork.
+    // Minor units (cents); nil until the first successful fetch.
+    @Published var extraCreditsMinor: Int?
+    @Published var extraCreditsGrantedMinor: Int?         // sum of granted tranches (bar denominator)
+    @Published var extraCreditsCurrency: String = "EUR"
+    @Published var extraCreditsError: String?             // shown as a quiet line in the popover
+    @Published var extraCreditsMode: BarMode = .off
+    @Published var extraCreditsThreshold: Int = 20           // whole currency units: show when balance ≤
+
+    // Console (platform.claude.com) API credit balance: purchased + promo tranches.
+    @Published var extraTranches: [CreditTranche] = []      // Max extra-usage tranches (for export)
+    @Published var consoleCreditsMinor: Int?                // total remaining, minor units
+    @Published var consolePurchasedTranches: [CreditTranche] = []
+    @Published var consolePromoTranches: [CreditTranche] = []
+    @Published var consolePurchasedMinor: Int = 0
+    @Published var consolePromoMinor: Int = 0
+    @Published var consolePromoExpires: Date?               // earliest promo expiry
+    @Published var consoleCurrency: String = "USD"
+    @Published var consoleCreditsError: String?
+    @Published var consoleMode: BarMode = .off
+    @Published var consoleThreshold: Int = 20               // whole currency units: show when balance ≤
+    @Published var snapshotDirectory: String = ""           // "" = default (Application Support/AIMeter)
+
     private func minutesUntil(_ date: Date?) -> Int? {
         guard let date = date else { return nil }
         let s = Int(date.timeIntervalSinceNow)
@@ -890,6 +934,37 @@ class UsageManager: ObservableObject {
     var showWeeklyTimer: Bool { showTimer(mode: weeklyTimerMode, date: weeklyResetsAt, threshold: weeklyTimerThreshold) }
     var showModelPercent: Bool { showPercent(mode: modelPercentMode, value: scopedWeekly.first?.percent ?? 0, threshold: modelPercentThreshold) }
     var showModelTimer: Bool { showTimer(mode: modelTimerMode, date: scopedWeekly.first?.resetsAt, threshold: modelTimerThreshold) }
+    var showExtraCredits: Bool {
+        guard let minor = extraCreditsMinor else { return false }
+        switch extraCreditsMode {
+        case .always: return true
+        case .when:   return minor <= extraCreditsThreshold * 100
+        case .off:    return false
+        }
+    }
+    var extraCreditsText: String? {
+        extraCreditsMinor.map { UsageManager.formatMoney(minor: $0, currency: extraCreditsCurrency) }
+    }
+    var showConsoleCredits: Bool {
+        guard let minor = consoleCreditsMinor else { return false }
+        switch consoleMode {
+        case .always: return true
+        case .when:   return minor <= consoleThreshold * 100
+        case .off:    return false
+        }
+    }
+    var consoleCreditsText: String? {
+        consoleCreditsMinor.map { UsageManager.formatMoney(minor: $0, currency: consoleCurrency) }
+    }
+
+    static func formatMoney(minor: Int, currency: String) -> String {
+        let f = NumberFormatter()
+        f.numberStyle = .currency
+        f.currencyCode = currency
+        f.maximumFractionDigits = 2
+        let value = Double(minor) / 100.0
+        return f.string(from: NSNumber(value: value)) ?? String(format: "%.2f %@", value, currency)
+    }
 
     // Countdown to each window's reset (e.g. "1h59m", "2d17h", "<1m"); nil if unknown.
     var sessionResetCountdown: String? { UsageManager.countdown(to: sessionResetsAt) }
@@ -918,6 +993,7 @@ class UsageManager: ObservableObject {
 
     private var statusItem: NSStatusItem?
     private var sessionCookie: String = ""
+    private var consoleCookie: String = ""     // platform.claude.com session (fork)
     private weak var delegate: AppDelegate?
     private var lastNotifiedThreshold: Int = 0
     // In-flight guard: prevents overlapping fetches from interleaving reset-detection
@@ -938,6 +1014,7 @@ class UsageManager: ObservableObject {
     }
 
     func loadSessionCookie() {
+        consoleCookie = KeychainHelper.load(account: KeychainHelper.consoleAccount) ?? ""
         // 1) New Keychain (post-rebrand). 2) Old Keychain service (pre-rebrand
         // "com.claude.usagebar") → migrate. 3) Legacy plaintext UserDefaults.
         if let kc = KeychainHelper.load() {
@@ -959,6 +1036,10 @@ class UsageManager: ObservableObject {
     var cookieHint: String {
         guard !sessionCookie.isEmpty else { return "" }
         return String(sessionCookie.prefix(20)) + "..."
+    }
+    var consoleCookieHint: String {
+        guard !consoleCookie.isEmpty else { return "" }
+        return String(consoleCookie.prefix(20)) + "..."
     }
 
     func loadSettings() {
@@ -1007,6 +1088,11 @@ class UsageManager: ObservableObject {
         if d.object(forKey: "weekly_timer_thr")  != nil { weeklyTimerThreshold  = d.integer(forKey: "weekly_timer_thr") }
         if d.object(forKey: "sonnet_percent_thr") != nil { modelPercentThreshold = d.integer(forKey: "sonnet_percent_thr") }
         if d.object(forKey: "model_timer_thr") != nil { modelTimerThreshold = d.integer(forKey: "model_timer_thr") }
+        extraCreditsMode = BarMode(rawValue: d.integer(forKey: "extra_credits_mode")) ?? .off
+        if d.object(forKey: "extra_credits_thr") != nil { extraCreditsThreshold = d.integer(forKey: "extra_credits_thr") }
+        consoleMode = BarMode(rawValue: d.integer(forKey: "console_mode")) ?? .off
+        if d.object(forKey: "console_thr") != nil { consoleThreshold = d.integer(forKey: "console_thr") }
+        snapshotDirectory = d.string(forKey: "snapshot_dir") ?? ""
         blinkEnabled = d.object(forKey: "blink_enabled") == nil ? true : d.bool(forKey: "blink_enabled")
         // Default shortcut to enabled if not previously set
         if UserDefaults.standard.object(forKey: "shortcut_enabled") == nil {
@@ -1032,6 +1118,10 @@ class UsageManager: ObservableObject {
         d.set(weeklyTimerThreshold, forKey: "weekly_timer_thr")
         d.set(modelPercentThreshold, forKey: "sonnet_percent_thr")
         d.set(modelTimerThreshold, forKey: "model_timer_thr")
+        d.set(extraCreditsMode.rawValue, forKey: "extra_credits_mode")
+        d.set(extraCreditsThreshold, forKey: "extra_credits_thr")
+        d.set(consoleMode.rawValue, forKey: "console_mode")
+        d.set(consoleThreshold, forKey: "console_thr")
         d.set(blinkEnabled, forKey: "blink_enabled")
     }
 
@@ -1090,11 +1180,36 @@ class UsageManager: ObservableObject {
     /// grow, churn, or wipe the credential — a dead sessionKey still surfaces
     /// through the normal 401/403 path.
     func absorbSetCookies(_ updates: [(name: String, value: String)]) {
-        guard !updates.isEmpty, !sessionCookie.isEmpty else { return }
+        guard let merged = UsageManager.mergeCookies(updates, into: sessionCookie) else { return }
+        sessionCookie = merged.cookie
+        if KeychainHelper.save(sessionCookie) {
+            // Names only — cookie VALUES must never reach the log.
+            NSLog("🔐 Rotated cookies persisted: \(merged.changed.joined(separator: ", "))")
+        } else {
+            NSLog("🔐 ⚠️ Keychain save failed for rotated cookies")
+        }
+    }
+
+    /// Same keep-fresh for the Console cookie (platform.claude.com rotates its own
+    /// sessionKey), persisted under its own Keychain account.
+    func absorbConsoleSetCookies(_ updates: [(name: String, value: String)]) {
+        guard let merged = UsageManager.mergeCookies(updates, into: consoleCookie) else { return }
+        consoleCookie = merged.cookie
+        if KeychainHelper.save(consoleCookie, account: KeychainHelper.consoleAccount) {
+            NSLog("🔐 Rotated Console cookies persisted: \(merged.changed.joined(separator: ", "))")
+        } else {
+            NSLog("🔐 ⚠️ Keychain save failed for rotated Console cookies")
+        }
+    }
+
+    /// Pure merge step of the keep-fresh; nil when nothing changed.
+    nonisolated static func mergeCookies(_ updates: [(name: String, value: String)],
+                                         into cookie: String) -> (cookie: String, changed: [String])? {
+        guard !updates.isEmpty, !cookie.isEmpty else { return nil }
 
         var order: [String] = []
         var values: [String: String] = [:]
-        for part in sessionCookie.components(separatedBy: ";") {
+        for part in cookie.components(separatedBy: ";") {
             let t = part.trimmingCharacters(in: .whitespaces)
             guard let eq = t.firstIndex(of: "="), eq != t.startIndex else { continue }
             let name = String(t[..<eq])
@@ -1108,16 +1223,11 @@ class UsageManager: ObservableObject {
             values[u.name] = u.value
             changedNames.append(u.name)
         }
-        guard !changedNames.isEmpty else { return }
+        guard !changedNames.isEmpty else { return nil }
 
-        sessionCookie = order.compactMap { n in values[n].map { "\(n)=\($0)" } }
+        let merged = order.compactMap { n in values[n].map { "\(n)=\($0)" } }
             .joined(separator: "; ")
-        if KeychainHelper.save(sessionCookie) {
-            // Names only — cookie VALUES must never reach the log.
-            NSLog("🔐 Rotated cookies persisted: \(changedNames.joined(separator: ", "))")
-        } else {
-            NSLog("🔐 ⚠️ Keychain save failed for rotated cookies")
-        }
+        return (merged, changedNames)
     }
 
     func saveSessionCookie(_ cookie: String) {
@@ -1164,6 +1274,35 @@ class UsageManager: ObservableObject {
         delegate?.updateStatusIcon(percentage: 0)
 
         NSLog("🔐 Cookie cleared, data reset")
+    }
+
+    func saveConsoleCookie(_ raw: String) {
+        var clean = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        // Accept a browser "Copy as cURL" paste: pull the Cookie header out of it.
+        if let r = clean.range(of: "Cookie: ", options: .caseInsensitive) {
+            var v = String(clean[r.upperBound...])
+            if let q = v.firstIndex(where: { $0 == "'" || $0 == "\"" }) { v = String(v[..<q]) }
+            clean = v.trimmingCharacters(in: .whitespacesAndNewlines)
+        }
+        guard !clean.unicodeScalars.contains(where: { $0.value < 0x20 }) else {
+            errorMessage = "Console cookie contains invalid characters"
+            return
+        }
+        consoleCookie = clean
+        consoleCreditsError = nil
+        if KeychainHelper.save(clean, account: KeychainHelper.consoleAccount) {
+            NSLog("🔐 Console cookie saved, length: \(clean.count)")
+        } else {
+            errorMessage = "Could not save Console cookie to Keychain"
+        }
+    }
+
+    func clearConsoleCookie() {
+        consoleCookie = ""
+        consoleCreditsMinor = nil
+        consoleCreditsError = nil
+        KeychainHelper.delete(account: KeychainHelper.consoleAccount)
+        updateStatusBar()
     }
 
     func fetchOrganizationId(cookie: String, completion: @escaping @MainActor (String?) -> Void) {
@@ -1223,6 +1362,9 @@ class UsageManager: ObservableObject {
         // Documented invariant (see file header): callers are on the main thread.
         dispatchPrecondition(condition: .onQueue(.main))
 
+        // The Console balance has its own cookie: fetch it regardless of the claude.ai one.
+        fetchConsoleCredits()
+
         guard !sessionCookie.isEmpty else {
             self.errorMessage = "Session cookie not set"
             self.updateStatusBar()
@@ -1249,7 +1391,281 @@ class UsageManager: ObservableObject {
                 return
             }
             self.fetchUsageWithOrgId(orgId, cookie: cookie)
+            self.fetchExtraCredits(orgId, cookie: cookie)
         }
+    }
+
+    // MARK: - Prepaid credits (fork)
+    //
+    // Money balances are distinct from the % quotas: the Max org has "extra usage"
+    // credits (claude.ai Settings → Usage, EUR), the Console org has the API credit
+    // balance (platform.claude.com Billing, USD). There is no public endpoint for
+    // either: the Admin API only has usage/cost reports and is unavailable to
+    // individual accounts. The Console UI reads them from this internal endpoint.
+    // With the claude.ai `sessionKey` it answers for the Max org (the claude.ai
+    // lastActiveOrg) and 403s for the Console org, so this call yields the Max
+    // extra-usage balance. Only `sessionKey` is sent — no other cookie — and
+    // Set-Cookie from this host is deliberately NOT absorbed, so a platform-side
+    // rotation can never overwrite the claude.ai cookie in the Keychain.
+    func fetchExtraCredits(_ orgId: String, cookie: String) {
+        guard let sessionKey = UsageManager.cookieValue("sessionKey", in: cookie),
+              let url = URL(string: "https://platform.claude.com/api/organizations/\(orgId)/prepaid/credits") else {
+            extraCreditsError = "no sessionKey in cookie"
+            return
+        }
+        let request = UsageManager.platformRequest(url: url, sessionKey: sessionKey)
+
+        URLSession.shared.dataTask(with: request) { [weak self] data, response, error in
+            let status = (response as? HTTPURLResponse)?.statusCode
+            let errorDesc = error?.localizedDescription
+            Task { @MainActor in
+                guard let self = self else { return }
+                if let errorDesc = errorDesc {
+                    NSLog("❌ Credits error: \(errorDesc)")
+                    self.extraCreditsError = "Network error"
+                    return
+                }
+                guard let status = status else {
+                    self.extraCreditsError = "Invalid response"
+                    return
+                }
+                NSLog("📡 Credits status: \(status)")
+                if status == 200, let data = data {
+                    self.parseExtraCreditsData(data)
+                    self.writeSnapshotFile()
+                } else if status == 401 || status == 403 {
+                    self.extraCreditsError = "Console session not accepted"
+                } else {
+                    self.extraCreditsError = "HTTP \(status)"
+                }
+                self.updateStatusBar()
+            }
+        }.resume()
+    }
+
+    func parseExtraCreditsData(_ data: Data) {
+        guard let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let amount = json["amount"] as? NSNumber else {
+            extraCreditsError = "Invalid credits JSON"
+            return
+        }
+        extraCreditsMinor = amount.intValue
+        extraCreditsCurrency = (json["currency"] as? String) ?? extraCreditsCurrency
+        // Everything ever granted (all tranches) is the denominator for the bar.
+        extraTranches = UsageManager.parseTranches((json["tranches"] as? [[String: Any]]) ?? [])
+        let granted = extraTranches.map(\.grantedMinor).reduce(0, +)
+        extraCreditsGrantedMinor = granted > 0 ? granted : nil
+        extraCreditsError = nil
+        vlog("💳 Credits: \(amount.intValue) \(extraCreditsCurrency) remaining of \(granted)")
+    }
+
+    /// Request to platform.claude.com carrying ONLY `sessionKey` (what the Console
+    /// UI sends that matters; verified 2026-10-23 — no extra headers needed).
+    nonisolated static func platformRequest(url: URL, sessionKey: String) -> URLRequest {
+        var request = URLRequest(url: url, cachePolicy: .reloadIgnoringLocalCacheData, timeoutInterval: 15)
+        request.setValue("sessionKey=\(sessionKey)", forHTTPHeaderField: "Cookie")
+        request.setValue("application/json", forHTTPHeaderField: "Accept")
+        request.setValue("web_console", forHTTPHeaderField: "anthropic-client-platform")
+        request.setValue("https://platform.claude.com/settings/billing", forHTTPHeaderField: "Referer")
+        request.setValue("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36", forHTTPHeaderField: "User-Agent")
+        return request
+    }
+
+    // Console API credit balance. The Console has its own session: the browser never
+    // sends claude.ai's cookie to platform.claude.com, and the two sessions can't read
+    // each other's org (claude.ai's sessionKey gets 403 on the Console org and vice
+    // versa — verified 2026-10-23). So this needs the pasted Console cookie, whose
+    // lastActiveOrg is the Console org. Set-Cookie IS absorbed here, into the Console
+    // cookie, to keep that snapshot fresh exactly like the claude.ai one.
+    func fetchConsoleCredits() {
+        guard !consoleCookie.isEmpty else { return }
+        guard let sessionKey = UsageManager.cookieValue("sessionKey", in: consoleCookie),
+              let orgId = UsageManager.cookieValue("lastActiveOrg", in: consoleCookie),
+              let url = URL(string: "https://platform.claude.com/api/organizations/\(orgId)/prepaid/credits") else {
+            consoleCreditsError = "Console cookie lacks sessionKey/lastActiveOrg"
+            return
+        }
+        let request = UsageManager.platformRequest(url: url, sessionKey: sessionKey)
+
+        URLSession.shared.dataTask(with: request) { [weak self] data, response, error in
+            let status = (response as? HTTPURLResponse)?.statusCode
+            let rotated = UsageManager.extractCookieUpdates(response)   // 200-only inside
+            let errorDesc = error?.localizedDescription
+            Task { @MainActor in
+                guard let self = self else { return }
+                if let errorDesc = errorDesc {
+                    NSLog("❌ Console credits error: \(errorDesc)")
+                    self.consoleCreditsError = "Network error"
+                    return
+                }
+                guard let status = status else {
+                    self.consoleCreditsError = "Invalid response"
+                    return
+                }
+                NSLog("📡 Console credits status: \(status)")
+                if status == 200, let data = data {
+                    self.absorbConsoleSetCookies(rotated)
+                    self.parseConsoleCreditsData(data)
+                    self.writeSnapshotFile()
+                } else if status == 401 || status == 403 {
+                    self.consoleCreditsError = "Console cookie expired — paste a fresh one"
+                } else {
+                    self.consoleCreditsError = "HTTP \(status)"
+                }
+                self.updateStatusBar()
+            }
+        }.resume()
+    }
+
+    func parseConsoleCreditsData(_ data: Data) {
+        guard let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let amount = json["amount"] as? NSNumber else {
+            consoleCreditsError = "Invalid Console credits JSON"
+            return
+        }
+        consoleCreditsMinor = amount.intValue
+        consoleCurrency = (json["currency"] as? String) ?? consoleCurrency
+        consolePurchasedTranches = UsageManager.parseTranches((json["tranches"] as? [[String: Any]]) ?? [])
+        consolePromoTranches = UsageManager.parseTranches((json["promo_tranches"] as? [[String: Any]]) ?? [])
+        consolePurchasedMinor = consolePurchasedTranches.map(\.remainingMinor).reduce(0, +)
+        consolePromoMinor = consolePromoTranches.map(\.remainingMinor).reduce(0, +)
+        consolePromoExpires = consolePromoTranches.compactMap(\.expiresAt).min()
+        consoleCreditsError = nil
+        statusMessage = nil   // clears "Console cookie saved, fetching…" like parseUsageData does
+        vlog("💳 Console credits: \(amount.intValue) \(consoleCurrency) (purchased \(consolePurchasedMinor), promo \(consolePromoMinor))")
+    }
+
+    /// Tranche list as the Console sends it (`tranches` / `promo_tranches`).
+    nonisolated static func parseTranches(_ raw: [[String: Any]]) -> [CreditTranche] {
+        raw.compactMap { t in
+            guard let remaining = (t["remaining_amount_minor_units"] as? NSNumber)?.intValue else { return nil }
+            let scopeKind = (t["scope"] as? [String: Any])?["kind"] as? String
+            return CreditTranche(
+                name: (t["name"] as? String) ?? (t["program_id"] as? String) ?? "credit",
+                remainingMinor: remaining,
+                grantedMinor: (t["granted_amount_minor_units"] as? NSNumber)?.intValue ?? remaining,
+                expiresAt: (t["expires_at"] as? String).flatMap(UsageManager.parseISODate),
+                scope: (scopeKind == nil || scopeKind == "unscoped") ? nil : scopeKind)
+        }
+    }
+
+    // MARK: - Export for Claude Code (fork)
+
+    /// Plain Markdown snapshot of everything the app knows, written for an LLM
+    /// reader: dot-decimal amounts with explicit currency, ISO dates, and the Console
+    /// credits tranche by tranche so a session can see exactly how much promo is left.
+    func exportText() -> String {
+        let iso = ISO8601DateFormatter()
+        iso.formatOptions = [.withInternetDateTime]
+        iso.timeZone = .current
+        func money(_ minor: Int, _ cur: String) -> String { String(format: "%.2f %@", Double(minor) / 100.0, cur) }
+        func when(_ d: Date?) -> String {
+            guard let d = d else { return "unknown" }
+            return iso.string(from: d) + (UsageManager.countdown(to: d).map { " (in \($0))" } ?? "")
+        }
+        func trancheLines(_ ts: [CreditTranche], _ cur: String) -> [String] {
+            ts.map { t in
+                var line = "  - \(t.name): \(money(t.remainingMinor, cur)) remaining of \(money(t.grantedMinor, cur))"
+                line += t.expiresAt.map { ", expires \(iso.string(from: $0))" } ?? ", no expiry"
+                if let s = t.scope { line += ", scope: \(s)" }
+                return line
+            }
+        }
+
+        var out: [String] = []
+        out.append("# AIMeter export — \(iso.string(from: Date()))")
+        out.append("")
+        out.append("## Claude Max plan quotas (claude.ai, percent of window used)")
+        out.append("- Session (5 h): \(sessionUsage)% used, resets \(when(sessionResetsAt))")
+        out.append("- Weekly, all models (7 d): \(weeklyUsage)% used, resets \(when(weeklyResetsAt))")
+        for sw in scopedWeekly {
+            out.append("- Weekly \(sw.name) (7 d): \(sw.percent)% used, resets \(when(sw.resetsAt))")
+        }
+        out.append("")
+        out.append("## Max extra-usage credits (claude.ai → Settings → Usage; used when the plan quota is exhausted)")
+        if let m = extraCreditsMinor {
+            let granted = extraCreditsGrantedMinor.map { " of \(money($0, extraCreditsCurrency)) granted" } ?? ""
+            out.append("- Remaining: \(money(m, extraCreditsCurrency))\(granted)")
+            out.append(contentsOf: trancheLines(extraTranches, extraCreditsCurrency))
+        } else {
+            out.append("- Not available\(extraCreditsError.map { " (\($0))" } ?? "")")
+        }
+        out.append("")
+        out.append("## Console API credits (platform.claude.com → Billing; spent by API keys, Claude Code on API billing, Agent SDK, Playground)")
+        if let total = consoleCreditsMinor {
+            out.append("- Total remaining: \(money(total, consoleCurrency))")
+            out.append("- Purchased credits remaining: \(money(consolePurchasedMinor, consoleCurrency))")
+            out.append(contentsOf: trancheLines(consolePurchasedTranches, consoleCurrency))
+            out.append("- Promotional credits remaining: \(money(consolePromoMinor, consoleCurrency))")
+            out.append(contentsOf: trancheLines(consolePromoTranches, consoleCurrency))
+            if consolePromoTranches.isEmpty { out.append("  - none") }
+        } else {
+            out.append("- Not available\(consoleCreditsError.map { " (\($0))" } ?? "")")
+        }
+        out.append("")
+        out.append("Data last fetched: \(iso.string(from: lastUpdated)). A fresh copy of this snapshot is rewritten after every refresh at \(snapshotURL.path).")
+        return out.joined(separator: "\n")
+    }
+
+    /// Snapshot file for other tools (e.g. a Claude Code session doing `cat` on it):
+    /// rewritten after every successful fetch, so it is never older than the refresh
+    /// interval. Atomic write. Folder is user-selectable (UserDefaults `snapshot_dir`),
+    /// default Application Support/AIMeter.
+    static let snapshotFileName = "aimeter-snapshot.md"
+    static let defaultSnapshotDirectory: URL = FileManager.default
+        .urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
+        .appendingPathComponent("AIMeter")
+    var snapshotURL: URL {
+        let dir = snapshotDirectory.isEmpty ? UsageManager.defaultSnapshotDirectory : URL(fileURLWithPath: snapshotDirectory)
+        return dir.appendingPathComponent(UsageManager.snapshotFileName)
+    }
+
+    func setSnapshotDirectory(_ path: String) {
+        snapshotDirectory = path
+        UserDefaults.standard.set(path, forKey: "snapshot_dir")
+        writeSnapshotFile()   // appear in the new place right away
+    }
+
+    /// Finder folder picker for the snapshot location.
+    func chooseSnapshotDirectory() {
+        let panel = NSOpenPanel()
+        panel.canChooseDirectories = true
+        panel.canChooseFiles = false
+        panel.canCreateDirectories = true
+        panel.prompt = "Use this folder"
+        panel.message = "AIMeter will rewrite \(UsageManager.snapshotFileName) here after every refresh."
+        panel.directoryURL = snapshotURL.deletingLastPathComponent()
+        NSApp.activate(ignoringOtherApps: true)
+        if panel.runModal() == .OK, let url = panel.url {
+            setSnapshotDirectory(url.path)
+        }
+    }
+
+    func writeSnapshotFile() {
+        let url = snapshotURL
+        do {
+            try FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
+            try exportText().write(to: url, atomically: true, encoding: .utf8)
+        } catch {
+            NSLog("📝 Snapshot write failed: \(error.localizedDescription)")
+        }
+    }
+
+    /// Put the export on the general pasteboard and confirm in the popover.
+    func copyExportToClipboard() {
+        let pb = NSPasteboard.general
+        pb.clearContents()
+        pb.setString(exportText(), forType: .string)
+        statusMessage = "Copied to clipboard — paste it into Claude Code"
+    }
+
+    /// Value of one named cookie inside a raw `Cookie:` header string.
+    nonisolated static func cookieValue(_ name: String, in cookie: String) -> String? {
+        for part in cookie.components(separatedBy: ";") {
+            let t = part.trimmingCharacters(in: .whitespaces)
+            if t.hasPrefix(name + "=") { return String(t.dropFirst(name.count + 1)) }
+        }
+        return nil
     }
 
     func fetchUsageWithOrgId(_ orgId: String, cookie: String) {
@@ -1311,6 +1727,7 @@ class UsageManager: ObservableObject {
                     self.cookieInvalid = false
                     self.absorbSetCookies(rotated)
                     self.parseUsageData(data)
+                    self.writeSnapshotFile()
                     // Only refresh the icon + run threshold notifications on fresh data.
                     self.updateStatusBar()
                 } else if status == 401 || status == 403 {
@@ -1919,6 +2336,7 @@ struct UsageView: View {
     @ObservedObject var usageManager: UsageManager
     @ObservedObject var statusManager: StatusManager
     @State private var sessionCookieInput: String = ""
+    @State private var consoleCookieInput: String = ""
     @State private var showingCookieInput: Bool = false
     @State private var showingSettings: Bool = false
     @State private var showingStatusDetails: Bool = false
@@ -2055,6 +2473,29 @@ struct UsageView: View {
                              color: Palette.model,
                              includeDate: true)
                 }
+
+                // API prepaid credit balance from the Console (fork).
+                if let minor = usageManager.extraCreditsMinor {
+                    extraCreditsRow(remainingMinor: minor,
+                               grantedMinor: usageManager.extraCreditsGrantedMinor,
+                               currency: usageManager.extraCreditsCurrency)
+                } else if let err = usageManager.extraCreditsError {
+                    Text("Extra usage credits: \(err)")
+                        .font(.caption).foregroundColor(.secondary)
+                }
+            }
+
+            // Console API credit balance (fork): separate cookie, shown even when the
+            // claude.ai one is missing.
+            if let total = usageManager.consoleCreditsMinor {
+                consoleCreditsRow(totalMinor: total,
+                                  purchasedMinor: usageManager.consolePurchasedMinor,
+                                  promoMinor: usageManager.consolePromoMinor,
+                                  promoExpires: usageManager.consolePromoExpires,
+                                  currency: usageManager.consoleCurrency)
+            } else if let err = usageManager.consoleCreditsError {
+                Text("API credits (Console): \(err)")
+                    .font(.caption).foregroundColor(.secondary)
             }
 
             if statusManager.hasFetched {
@@ -2074,6 +2515,12 @@ struct UsageView: View {
                     .font(.caption)
                     .foregroundColor(.secondary)
                 Spacer()
+                // Export (fork): Markdown snapshot for an LLM reader (Claude Code).
+                Button("Copy for Claude Code") {
+                    usageManager.copyExportToClipboard()
+                }
+                .buttonStyle(.borderless)
+                .font(.caption)
                 Button("Refresh") {
                     usageManager.fetchUsage()
                     statusManager.fetch()
@@ -2322,6 +2769,58 @@ struct UsageView: View {
                 .padding(8)
                 .background(Color.secondary.opacity(0.1))
                 .cornerRadius(6)
+
+                // Console cookie (fork): second, independent session for the API
+                // credit balance on platform.claude.com.
+                VStack(alignment: .leading, spacing: 8) {
+                    Text("Console cookie (API credit balance):")
+                        .font(.caption)
+                        .fontWeight(.semibold)
+
+                    VStack(alignment: .leading, spacing: 4) {
+                        Text("1. Go to platform.claude.com > Settings > Billing")
+                        Text("2. Safari: Develop > Show Web Inspector > Network")
+                        Text("3. Reload page, find the 'credits' request")
+                        Text("4. Right-click it > Copy as cURL, paste below\n   (or copy its 'Cookie' request header)")
+                    }
+                    .font(.caption2)
+                    .foregroundColor(.secondary)
+
+                    if !usageManager.consoleCookieHint.isEmpty {
+                        Text("Current: \(usageManager.consoleCookieHint)")
+                            .font(.caption2)
+                            .foregroundColor(.secondary)
+                    }
+                    PasteableTextField(text: $consoleCookieInput, placeholder: "Paste Console cookie (or cURL) here...")
+                        .frame(height: 60)
+                        .cornerRadius(4)
+
+                    HStack(spacing: 8) {
+                        Button("Save Console Cookie & Fetch") {
+                            if consoleCookieInput.isEmpty {
+                                usageManager.errorMessage = "Console cookie field is empty!"
+                            } else {
+                                usageManager.saveConsoleCookie(consoleCookieInput)
+                                usageManager.statusMessage = "Console cookie saved, fetching…"
+                                usageManager.fetchConsoleCredits()
+                            }
+                        }
+                        .buttonStyle(.borderedProminent)
+                        .controlSize(.small)
+
+                        if !usageManager.consoleCookieHint.isEmpty {
+                            Button("Clear") {
+                                consoleCookieInput = ""
+                                usageManager.clearConsoleCookie()
+                            }
+                            .buttonStyle(.bordered)
+                            .controlSize(.small)
+                        }
+                    }
+                }
+                .padding(8)
+                .background(Color.secondary.opacity(0.1))
+                .cornerRadius(6)
         }
     }
 
@@ -2380,6 +2879,25 @@ struct UsageView: View {
                         .buttonStyle(.borderless)
                         .disabled(usageManager.isLoading)
                     }
+                    // Snapshot file (fork): same text as "Copy for Claude Code", rewritten
+                    // after every refresh, for tools that read it on their own. Folder is
+                    // user-selectable so it can live inside a project Claude Code works in.
+                    VStack(alignment: .leading, spacing: 4) {
+                        Text("Snapshot file (rewritten at every refresh):")
+                            .font(.caption2).foregroundColor(.secondary)
+                        Text(usageManager.snapshotURL.path)
+                            .font(.caption2).foregroundColor(.primary)
+                            .textSelection(.enabled)
+                            .fixedSize(horizontal: false, vertical: true)
+                        HStack(spacing: 8) {
+                            Button("Choose folder…") { usageManager.chooseSnapshotDirectory() }
+                                .buttonStyle(.bordered).controlSize(.small)
+                            if !usageManager.snapshotDirectory.isEmpty {
+                                Button("Default") { usageManager.setSnapshotDirectory("") }
+                                    .buttonStyle(.bordered).controlSize(.small)
+                            }
+                        }
+                    }
 
                     Divider()
 
@@ -2403,6 +2921,12 @@ struct UsageView: View {
                         barRow("Weekly \(usageManager.scopedWeekly.first?.name ?? "model") reset timer", Palette.model, isPercent: false,
                                modeGet: { usageManager.modelTimerMode }, modeSet: { usageManager.modelTimerMode = $0 },
                                thrGet: { usageManager.modelTimerThreshold }, thrSet: { usageManager.modelTimerThreshold = $0 })
+                        barRow("Extra usage credits (Max)", Palette.credits, isPercent: false, moneyCode: usageManager.extraCreditsCurrency,
+                               modeGet: { usageManager.extraCreditsMode }, modeSet: { usageManager.extraCreditsMode = $0 },
+                               thrGet: { usageManager.extraCreditsThreshold }, thrSet: { usageManager.extraCreditsThreshold = $0 })
+                        barRow("API credits (Console)", Palette.console, isPercent: false, moneyCode: usageManager.consoleCurrency,
+                               modeGet: { usageManager.consoleMode }, modeSet: { usageManager.consoleMode = $0 },
+                               thrGet: { usageManager.consoleThreshold }, thrSet: { usageManager.consoleThreshold = $0 })
                         Toggle(isOn: Binding(
                             get: { usageManager.blinkEnabled },
                             set: { usageManager.blinkEnabled = $0; usageManager.applyMenuBarSettings() }
@@ -2548,10 +3072,53 @@ struct UsageView: View {
         }
     }
 
+    /// Prepaid API credit balance (Console): same layout as usageRow, but the bar
+    /// is the share of granted credits already spent and the labels are money.
+    private func extraCreditsRow(remainingMinor: Int, grantedMinor: Int?, currency: String) -> some View {
+        let remaining = UsageManager.formatMoney(minor: remainingMinor, currency: currency)
+        let used: Double? = grantedMinor.map { g in min(max(1 - Double(remainingMinor) / Double(g), 0), 1) }
+        return VStack(alignment: .leading, spacing: 4) {
+            HStack {
+                Text("Extra usage credits (Max)").font(.subheadline)
+                Spacer()
+                Text("\(remaining) left").font(.caption).foregroundColor(.secondary)
+            }
+            if let used = used, let g = grantedMinor {
+                ProgressView(value: used).tint(Palette.credits)
+                Text("\(Int(used * 100))% of \(UsageManager.formatMoney(minor: g, currency: currency)) used")
+                    .font(.caption).foregroundColor(Palette.credits)
+            }
+        }
+    }
+
+    /// Console API credit balance: purchased + promotional tranches. No bar — the
+    /// promo part expires on its own schedule, so a single "% used" would mislead.
+    private func consoleCreditsRow(totalMinor: Int, purchasedMinor: Int, promoMinor: Int,
+                                   promoExpires: Date?, currency: String) -> some View {
+        let money = { (m: Int) in UsageManager.formatMoney(minor: m, currency: currency) }
+        let expiry = promoExpires.map { " (expires \(formatShortDate($0)))" } ?? ""
+        return VStack(alignment: .leading, spacing: 4) {
+            HStack {
+                Text("API credits (Console)").font(.subheadline)
+                Spacer()
+                Text("\(money(totalMinor)) left").font(.caption).foregroundColor(.secondary)
+            }
+            Text("Purchased \(money(purchasedMinor)) · Promo \(money(promoMinor))\(expiry)")
+                .font(.caption).foregroundColor(Palette.console)
+                .fixedSize(horizontal: false, vertical: true)
+        }
+    }
+
+    func formatShortDate(_ date: Date) -> String {
+        let formatter = DateFormatter()
+        formatter.dateFormat = "d MMM yyyy"
+        return formatter.string(from: date)
+    }
+
     /// One configurable menu-bar value: label + mode picker (Off/Always/When) and,
     /// when "When", a threshold stepper (% for percentages, minutes for timers).
     @ViewBuilder
-    private func barRow(_ label: String, _ color: Color, isPercent: Bool,
+    private func barRow(_ label: String, _ color: Color, isPercent: Bool, moneyCode: String? = nil,
                         modeGet: @escaping () -> BarMode, modeSet: @escaping (BarMode) -> Void,
                         thrGet: @escaping () -> Int, thrSet: @escaping (Int) -> Void) -> some View {
         VStack(alignment: .leading, spacing: 2) {
@@ -2567,7 +3134,10 @@ struct UsageView: View {
             }
             if modeGet() == .when {
                 let thr = Binding(get: thrGet, set: { thrSet($0); usageManager.applyMenuBarSettings() })
-                if isPercent {
+                if let code = moneyCode {
+                    Stepper("show if balance ≤ \(thrGet()) \(code)", value: thr, in: 0...1000, step: 5)
+                        .font(.caption2).foregroundColor(.secondary)
+                } else if isPercent {
                     Stepper("show if ≥ \(thrGet())%", value: thr, in: 0...100, step: 5)
                         .font(.caption2).foregroundColor(.secondary)
                 } else {
