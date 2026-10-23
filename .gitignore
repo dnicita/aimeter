@@ -10,3 +10,6 @@ backups/
 .claude/
 .DS_Store
 *.log
+
+# Session handoff (local snapshot, not part of the fork)
+HANDOFF.md
