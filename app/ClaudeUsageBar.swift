@@ -314,6 +314,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
     var ringBlinkOn: Bool = true     // blink phase of the session ring (low-quota alarm)
     var statusBlinkOn: Bool = true   // blink phase of the center status dot (outage)
     var appearanceObservation: NSKeyValueObservation?  // menu bar light/dark flips
+    var lastDrawnIsDark: Bool?       // appearance the icon was last baked for (loop guard)
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         // NSUserNotification (deprecated but works without permissions for unsigned apps)
@@ -338,8 +339,18 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
 
             // The ring icon is a baked bitmap: re-render it when the menu bar
             // flips light/dark (the title's dynamic colors update on their own).
-            appearanceObservation = button.observe(\.effectiveAppearance) { [weak self] _, _ in
-                DispatchQueue.main.async { MainActor.assumeIsolated { self?.drawIcon() } }
+            // KVO also fires when AppKit re-sets an UNCHANGED appearance while it
+            // redraws the status item — and drawIcon() itself schedules that redraw,
+            // so reacting unconditionally is an infinite redraw loop (~95% CPU,
+            // seen on macOS 27). Redraw only on a real light/dark flip.
+            appearanceObservation = button.observe(\.effectiveAppearance) { [weak self] button, _ in
+                let isDark = AppDelegate.isDark(button.effectiveAppearance)
+                DispatchQueue.main.async {
+                    MainActor.assumeIsolated {
+                        guard let self = self, self.lastDrawnIsDark != isDark else { return }
+                        self.drawIcon()
+                    }
+                }
             }
         }
 
@@ -692,7 +703,12 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
                                           drawRing: drawRing,
                                           dotColor: drawDot ? dot : nil)
         }
+        lastDrawnIsDark = AppDelegate.isDark(button.effectiveAppearance)
         button.attributedTitle = menuBarTitle()
+    }
+
+    nonisolated static func isDark(_ appearance: NSAppearance) -> Bool {
+        appearance.bestMatch(from: [.aqua, .darkAqua]) == .darkAqua
     }
 
     /// Colored menu-bar text: session % (+optional bits), then weekly, then per-model.
