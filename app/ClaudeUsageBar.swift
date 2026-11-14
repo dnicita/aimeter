@@ -1957,19 +1957,24 @@ class UsageManager: ObservableObject {
             }
         }
 
+        // Both figures on every quota line, so the reader never has to derive one.
+        func usedLeft(_ used: Int) -> String { "\(used)% used, \(max(0, 100 - used))% left" }
+
         var out: [String] = []
         out.append("# AIMeter export — \(iso.string(from: Date()))")
+        out.append("")
+        out.append("Format: one `## <Vendor> …` section per vendor (Claude, OpenAI, Google). Quota lines are `- <name> (<duration>): <N>% used, <M>% left, resets <ISO 8601> (in <countdown>)`. `unknown` means the value is not available. Quota lines appear and disappear as vendors add or drop limits: read every `% used` line in a section, do not rely on names or positions.")
         out.append("")
         out.append("## Claude Max plan quotas (claude.ai, percent of window used)")
         // Contract with the reader (a Claude Code session): one section per vendor,
         // vendor name first in the title; every quota line has the same shape
-        // "- <name> (<duration>): <N>% used, resets <ISO>"; a missing value stays on
+        // "- <name> (<duration>): <N>% used, <M>% left, resets <ISO>"; a missing value stays on
         // its line as "unknown" instead of the line disappearing.
         if limits.isEmpty {
-            out.append("- Weekly, all models (7 d): unknown% used, resets unknown")
+            out.append("- Weekly, all models (7 d): unknown% used, unknown% left, resets unknown")
         }
         for l in limits {
-            out.append("- \(l.snapshotName) (\(l.duration ?? "unknown")): \(l.percent)% used, resets \(when(l.resetsAt))")
+            out.append("- \(l.snapshotName) (\(l.duration ?? "unknown")): \(usedLeft(l.percent)), resets \(when(l.resetsAt))")
         }
         out.append("")
         out.append("## Claude Max extra-usage credits (claude.ai → Settings → Usage; used when the plan quota is exhausted)")
@@ -2000,10 +2005,10 @@ class UsageManager: ObservableObject {
         out.append("- Plan: \(codexPlan ?? "unknown")")
         if codexWindows.isEmpty {
             let why = codexError ?? (UsageManager.codexExecutable() == nil ? "codex CLI not installed" : "not fetched yet")
-            out.append("- Codex (unknown): unknown% used, resets unknown (\(why))")
+            out.append("- Codex (unknown): unknown% used, unknown% left, resets unknown (\(why))")
         } else {
             for w in codexWindows {
-                out.append("- Codex, \(w.quotaName) (\(w.shortDuration)): \(w.percent)% used, resets \(when(w.resetsAt))")
+                out.append("- Codex, \(w.quotaName) (\(w.shortDuration)): \(usedLeft(w.percent)), resets \(when(w.resetsAt))")
             }
         }
         out.append("")
@@ -2011,10 +2016,10 @@ class UsageManager: ObservableObject {
         out.append("- Plan: unknown")
         if agyQuotas.isEmpty {
             let why = agyError ?? (UsageManager.agyExecutable() == nil ? "agy CLI not installed" : "not fetched yet")
-            out.append("- Antigravity (unknown): unknown% used, resets unknown (\(why))")
+            out.append("- Antigravity (unknown): unknown% used, unknown% left, resets unknown (\(why))")
         }
         for q in agyQuotas {
-            out.append("- Antigravity, \(q.group) \(q.window) (\(q.duration ?? "unknown")): \(q.percent)% used, resets \(when(q.resetsAt))")
+            out.append("- Antigravity, \(q.group) \(q.window) (\(q.duration ?? "unknown")): \(usedLeft(q.percent)), resets \(when(q.resetsAt))")
         }
         out.append("")
         out.append("Data last fetched: \(iso.string(from: lastUpdated)). A fresh copy of this snapshot is rewritten after every refresh at \(snapshotURL.path).")
