@@ -35,7 +35,7 @@ private func vlog(_ message: @autoclosure () -> String) {
 
 // Menu-bar display mode for an optional extra value. Int-backed so the persisted
 // rawValue stays compatible with the existing UserDefaults integers (0/1/2).
-enum BarMode: Int {
+enum BarMode: Int, Codable {
     case off = 0      // never show
     case always = 1   // always show
     case when = 2     // show only when the threshold condition is met
@@ -271,6 +271,15 @@ enum Palette {
     static let console = Color(.sRGB, red: 0.06, green: 0.61, blue: 0.47)  // darker #0F9B78
     static let codex   = Color(.sRGB, red: 0.60, green: 0.52, blue: 0.00)  // dark gold #998500
     static let alert   = Color(.sRGB, red: 1.00, green: 0.23, blue: 0.19)
+
+    /// Identity color of a usage limit, by kind: (menu bar, popover).
+    static func limitColors(_ kind: String) -> (bar: NSColor, popover: Color) {
+        switch kind {
+        case "session":    return (sessionNS, session)
+        case "weekly_all": return (weeklyNS, weekly)
+        default:           return (modelNS, model)
+        }
+    }
 
     /// Linear sRGB interpolation between two NSColors.
     static func lerp(_ a: NSColor, _ b: NSColor, _ t: CGFloat) -> NSColor {
@@ -529,9 +538,6 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
 
     func openPopover() {
         if let button = statusItem.button {
-            // Already on main here — refresh synchronously so it takes effect before show.
-            usageManager.updatePercentages()
-
             // Size the popover from the last measured content height BEFORE showing.
             // (Resizing AFTER show is what breaks NSPopover's anchoring / pushes the
             // top off-screen — so we never do it while visible.)
@@ -726,19 +732,15 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         guard let um = usageManager else { return NSAttributedString(string: " \(lastSessionPercent)%") }
 
 
-        // Weekly: % and timer are independent toggles.
-        if um.showWeeklyPercent || um.showWeeklyTimer {
+        // One segment per API limit; % and timer are independent options.
+        var first = true
+        for l in um.limits {
             var parts: [String] = []
-            if um.showWeeklyPercent { parts.append("\(um.weeklyUsage)%") }
-            if um.showWeeklyTimer, let t = um.weeklyResetCountdown { parts.append(t) }
-            if !parts.isEmpty { seg(" " + parts.joined(separator: " "), Palette.weeklyNS) }
-        }
-        // Per-model window: % and timer are independent toggles, same as Weekly.
-        if let sw = um.scopedWeekly.first, um.showModelPercent || um.showModelTimer {
-            var parts: [String] = []
-            if um.showModelPercent { parts.append("\(sw.percent)%") }
-            if um.showModelTimer, let t = UsageManager.countdown(to: sw.resetsAt) { parts.append(t) }
-            if !parts.isEmpty { seg("  " + parts.joined(separator: " "), Palette.modelNS) }
+            if um.showLimitPercent(l) { parts.append("\(l.percent)%") }
+            if um.showLimitTimer(l), let t = UsageManager.countdown(to: l.resetsAt) { parts.append(t) }
+            guard !parts.isEmpty else { continue }
+            seg((first ? " " : "  ") + parts.joined(separator: " "), Palette.limitColors(l.kind).bar)
+            first = false
         }
         // Money balances: Max extra-usage credits, Console API credits.
         if um.showExtraCredits, let t = um.extraCreditsText { seg("  " + t, Palette.creditsNS) }
@@ -836,14 +838,56 @@ struct Main {
     }
 }
 
-/// One per-model weekly window (a `weekly_scoped` entry of the June-2026 `limits`
-/// array, e.g. "Fable"). The display name comes from the API, so newly limited
-/// models appear without code changes.
-struct ScopedWeeklyLimit: Equatable, Identifiable {
-    let name: String
+/// One usage window exactly as claude.ai's `limits` array reports it. Popover
+/// rows, Settings rows, menu-bar values and snapshot lines are all generated from
+/// the list, so a window Anthropic adds or drops shows up / disappears without a
+/// code change (the 5-hour session vanished in Nov 2026; per-model ones come and go).
+struct UsageLimit: Equatable, Identifiable {
+    let id: String          // stable settings key: kind, plus the scope name when scoped
+    let kind: String        // "weekly_all", "weekly_scoped", "session", or a future kind
+    let title: String       // "Weekly", "Weekly Fable", "Session"…
+    let duration: String?   // "7 d", "5 h"; nil when the API gives no hint
     let percent: Int
     let resetsAt: Date?
-    var id: String { name }
+
+    static func make(kind: String, scope: String?, group: String?, percent: Int, resetsAt: Date?) -> UsageLimit {
+        let title: String
+        switch kind {
+        case "session":       title = "Session"
+        case "weekly_all":    title = "Weekly"
+        case "weekly_scoped": title = "Weekly \(scope ?? "model")"
+        default:
+            title = kind.replacingOccurrences(of: "_", with: " ").capitalized + (scope.map { " \($0)" } ?? "")
+        }
+        let duration: String?
+        switch group ?? kind {
+        case "session", "five_hour":                     duration = "5 h"
+        case "daily":                                    duration = "1 d"
+        case "weekly", "weekly_all", "weekly_scoped":    duration = "7 d"
+        case "monthly":                                  duration = "30 d"
+        default:                                         duration = kind.hasPrefix("weekly") ? "7 d" : nil
+        }
+        return UsageLimit(id: scope.map { "\(kind):\($0)" } ?? kind, kind: kind, title: title,
+                          duration: duration, percent: percent, resetsAt: resetsAt)
+    }
+
+    /// Popover title: "Weekly Fable (7 day)".
+    var rowTitle: String {
+        guard let d = duration else { return title }
+        let long = d.replacingOccurrences(of: " d", with: " day").replacingOccurrences(of: " h", with: " hour")
+        return "\(title) (\(long))"
+    }
+    /// Snapshot name, kept stable for the reading agent.
+    var snapshotName: String { kind == "weekly_all" ? "Weekly, all models" : title }
+}
+
+/// Menu-bar options of one limit. New limits start Off (the bar never grows by
+/// surprise); only the all-models weekly % is on by default.
+struct LimitBarSettings: Codable, Equatable {
+    var percentMode: BarMode = .off
+    var percentThreshold: Int = 80      // show if ≥ N%
+    var timerMode: BarMode = .off
+    var timerThreshold: Int = 60        // show if reset ≤ N min
 }
 
 /// The core model. Polls claude.ai's internal usage API — primary source is the
@@ -899,14 +943,11 @@ struct CreditTranche: Equatable {
 
 @MainActor
 class UsageManager: ObservableObject {
-    // The API reports each window's utilization as a percent (0–100), so these
-    // values ARE the percentage — no separate limit field is needed.
-    @Published var sessionUsage: Int = 0
+    // Every window the API reports, in API order. `weeklyUsage` is the primary one
+    // (all-models weekly, else the first): it drives the ring and the alerts.
+    @Published var limits: [UsageLimit] = []
     @Published var weeklyUsage: Int = 0
-    @Published var sessionResetsAt: Date?
-    @Published var weeklyResetsAt: Date?
-    // Per-model weekly windows (e.g. Fable). Usually 0 or 1 entries today.
-    @Published var scopedWeekly: [ScopedWeeklyLimit] = []
+    @Published var limitSettings: [String: LimitBarSettings] = [:]
     @Published var lastUpdated: Date = Date()
     @Published var isLoading: Bool = false
     @Published var errorMessage: String?
@@ -932,20 +973,6 @@ class UsageManager: ObservableObject {
     @Published var refreshIntervalMinutes: Int = 5      // configurable poll interval
     @Published var loginItemStatus: String = "—"        // LaunchAgent status string ("Enabled (LaunchAgent)" / "Not registered")
 
-    // Menu-bar display modes per extra value (default: Off → only primary %).
-    // % thresholds mean "show if ≥ N%"; timer thresholds mean "show if reset ≤ N min".
-    @Published var sessionTimerMode: BarMode = .off
-    @Published var sessionTimerThreshold: Int = 60      // minutes
-    @Published var weeklyPercentMode: BarMode = .off
-    @Published var weeklyPercentThreshold: Int = 80     // percent
-    @Published var weeklyTimerMode: BarMode = .off
-    @Published var weeklyTimerThreshold: Int = 60       // minutes
-    // Per-model weekly % (UserDefaults keys keep the legacy "sonnet_*" names
-    // for settings compatibility with older builds).
-    @Published var modelPercentMode: BarMode = .off
-    @Published var modelPercentThreshold: Int = 80      // percent
-    @Published var modelTimerMode: BarMode = .off
-    @Published var modelTimerThreshold: Int = 60        // minutes
     @Published var blinkEnabled: Bool = true
 
     // API prepaid credit balance from the Console (platform.claude.com), fork.
@@ -1002,12 +1029,26 @@ class UsageManager: ObservableObject {
         case .off:    return false
         }
     }
-    // Effective visibility used by the menu-bar title builder.
-    var showSessionTimer: Bool { showTimer(mode: sessionTimerMode, date: sessionResetsAt, threshold: sessionTimerThreshold) }
-    var showWeeklyPercent: Bool { showPercent(mode: weeklyPercentMode, value: weeklyUsage, threshold: weeklyPercentThreshold) }
-    var showWeeklyTimer: Bool { showTimer(mode: weeklyTimerMode, date: weeklyResetsAt, threshold: weeklyTimerThreshold) }
-    var showModelPercent: Bool { showPercent(mode: modelPercentMode, value: scopedWeekly.first?.percent ?? 0, threshold: modelPercentThreshold) }
-    var showModelTimer: Bool { showTimer(mode: modelTimerMode, date: scopedWeekly.first?.resetsAt, threshold: modelTimerThreshold) }
+    // Per-limit menu-bar options (keyed by UsageLimit.id).
+    func barSettings(for id: String) -> LimitBarSettings {
+        if let s = limitSettings[id] { return s }
+        var s = LimitBarSettings()
+        if id == "weekly_all" { s.percentMode = .always }   // the base value
+        return s
+    }
+    func updateBarSettings(for id: String, _ change: (inout LimitBarSettings) -> Void) {
+        var s = barSettings(for: id)
+        change(&s)
+        limitSettings[id] = s
+    }
+    func showLimitPercent(_ l: UsageLimit) -> Bool {
+        let s = barSettings(for: l.id)
+        return showPercent(mode: s.percentMode, value: l.percent, threshold: s.percentThreshold)
+    }
+    func showLimitTimer(_ l: UsageLimit) -> Bool {
+        let s = barSettings(for: l.id)
+        return showTimer(mode: s.timerMode, date: l.resetsAt, threshold: s.timerThreshold)
+    }
     var showExtraCredits: Bool {
         guard let minor = extraCreditsMinor else { return false }
         switch extraCreditsMode {
@@ -1046,10 +1087,7 @@ class UsageManager: ObservableObject {
         return f.string(from: NSNumber(value: value)) ?? String(format: "%.2f %@", value, currency)
     }
 
-    // Countdown to each window's reset (e.g. "1h59m", "2d17h", "<1m"); nil if unknown.
-    var sessionResetCountdown: String? { UsageManager.countdown(to: sessionResetsAt) }
-    var weeklyResetCountdown: String?  { UsageManager.countdown(to: weeklyResetsAt) }
-
+    // Countdown to a window's reset (e.g. "1h59m", "2d17h", "<1m"); nil if unknown.
     static func countdown(to date: Date?) -> String? {
         guard let date = date else { return nil }
         let s = Int(date.timeIntervalSinceNow)
@@ -1155,18 +1193,26 @@ class UsageManager: ObservableObject {
 
         // Menu-bar display modes/thresholds + blink.
         let d = UserDefaults.standard
-        // Int rawValue persistence keeps backward compatibility with saved 0/1/2 values.
-        sessionTimerMode = BarMode(rawValue: d.integer(forKey: "session_timer_mode")) ?? .off
-        weeklyPercentMode = d.object(forKey: "weekly_percent_mode") == nil ? .always
-            : BarMode(rawValue: d.integer(forKey: "weekly_percent_mode")) ?? .off
-        weeklyTimerMode = BarMode(rawValue: d.integer(forKey: "weekly_timer_mode")) ?? .off
-        modelPercentMode = BarMode(rawValue: d.integer(forKey: "sonnet_percent_mode")) ?? .off
-        modelTimerMode = BarMode(rawValue: d.integer(forKey: "model_timer_mode")) ?? .off
-        if d.object(forKey: "session_timer_thr") != nil { sessionTimerThreshold = d.integer(forKey: "session_timer_thr") }
-        if d.object(forKey: "weekly_percent_thr") != nil { weeklyPercentThreshold = d.integer(forKey: "weekly_percent_thr") }
-        if d.object(forKey: "weekly_timer_thr")  != nil { weeklyTimerThreshold  = d.integer(forKey: "weekly_timer_thr") }
-        if d.object(forKey: "sonnet_percent_thr") != nil { modelPercentThreshold = d.integer(forKey: "sonnet_percent_thr") }
-        if d.object(forKey: "model_timer_thr") != nil { modelTimerThreshold = d.integer(forKey: "model_timer_thr") }
+        // Per-limit options live in one JSON blob. First run after the dynamic-limits
+        // change: seed it from the old fixed keys (the per-model ones are parked under
+        // "legacy_scoped" until the first fetch tells us that model's name).
+        if let data = d.data(forKey: "limit_bar_settings"),
+           let saved = try? JSONDecoder().decode([String: LimitBarSettings].self, from: data) {
+            limitSettings = saved
+        } else {
+            func legacy(_ pm: String, _ pt: String, _ tm: String, _ tt: String, percentDefault: BarMode) -> LimitBarSettings {
+                var s = LimitBarSettings()
+                s.percentMode = d.object(forKey: pm) == nil ? percentDefault : BarMode(rawValue: d.integer(forKey: pm)) ?? .off
+                if d.object(forKey: pt) != nil { s.percentThreshold = d.integer(forKey: pt) }
+                s.timerMode = BarMode(rawValue: d.integer(forKey: tm)) ?? .off
+                if d.object(forKey: tt) != nil { s.timerThreshold = d.integer(forKey: tt) }
+                return s
+            }
+            limitSettings["weekly_all"] = legacy("weekly_percent_mode", "weekly_percent_thr",
+                                                 "weekly_timer_mode", "weekly_timer_thr", percentDefault: .always)
+            limitSettings["legacy_scoped"] = legacy("sonnet_percent_mode", "sonnet_percent_thr",
+                                                    "model_timer_mode", "model_timer_thr", percentDefault: .off)
+        }
         extraCreditsMode = BarMode(rawValue: d.integer(forKey: "extra_credits_mode")) ?? .off
         if d.object(forKey: "extra_credits_thr") != nil { extraCreditsThreshold = d.integer(forKey: "extra_credits_thr") }
         consoleMode = BarMode(rawValue: d.integer(forKey: "console_mode")) ?? .off
@@ -1193,16 +1239,7 @@ class UsageManager: ObservableObject {
         UserDefaults.standard.set(shortcutEnabled, forKey: "shortcut_enabled")
         UserDefaults.standard.set(refreshIntervalMinutes, forKey: "refresh_interval_minutes")
         let d = UserDefaults.standard
-        d.set(sessionTimerMode.rawValue, forKey: "session_timer_mode")
-        d.set(weeklyPercentMode.rawValue, forKey: "weekly_percent_mode")
-        d.set(weeklyTimerMode.rawValue, forKey: "weekly_timer_mode")
-        d.set(modelPercentMode.rawValue, forKey: "sonnet_percent_mode")
-        d.set(modelTimerMode.rawValue, forKey: "model_timer_mode")
-        d.set(sessionTimerThreshold, forKey: "session_timer_thr")
-        d.set(weeklyPercentThreshold, forKey: "weekly_percent_thr")
-        d.set(weeklyTimerThreshold, forKey: "weekly_timer_thr")
-        d.set(modelPercentThreshold, forKey: "sonnet_percent_thr")
-        d.set(modelTimerThreshold, forKey: "model_timer_thr")
+        if let data = try? JSONEncoder().encode(limitSettings) { d.set(data, forKey: "limit_bar_settings") }
         d.set(extraCreditsMode.rawValue, forKey: "extra_credits_mode")
         d.set(extraCreditsThreshold, forKey: "extra_credits_thr")
         d.set(consoleMode.rawValue, forKey: "console_mode")
@@ -1351,11 +1388,8 @@ class UsageManager: ObservableObject {
         UserDefaults.standard.removeObject(forKey: "cookie_invalid_notified")
 
         // Reset all data
-        sessionUsage = 0
         weeklyUsage = 0
-        scopedWeekly = []
-        sessionResetsAt = nil
-        weeklyResetsAt = nil
+        limits = []
         hasFetchedData = false
         errorMessage = nil
         lastNotifiedThreshold = 0
@@ -1800,10 +1834,11 @@ class UsageManager: ObservableObject {
         // vendor name first in the title; every quota line has the same shape
         // "- <name> (<duration>): <N>% used, resets <ISO>"; a missing value stays on
         // its line as "unknown" instead of the line disappearing.
-        let known = hasFetchedData
-        out.append("- Weekly, all models (7 d): \(known ? "\(weeklyUsage)" : "unknown")% used, resets \(when(weeklyResetsAt))")
-        for sw in scopedWeekly {
-            out.append("- Weekly \(sw.name) (7 d): \(sw.percent)% used, resets \(when(sw.resetsAt))")
+        if limits.isEmpty {
+            out.append("- Weekly, all models (7 d): unknown% used, resets unknown")
+        }
+        for l in limits {
+            out.append("- \(l.snapshotName) (\(l.duration ?? "unknown")): \(l.percent)% used, resets \(when(l.resetsAt))")
         }
         out.append("")
         out.append("## Claude Max extra-usage credits (claude.ai → Settings → Usage; used when the plan quota is exhausted)")
@@ -2027,54 +2062,44 @@ class UsageManager: ObservableObject {
 
             NSLog("📊 Parsing usage data...")
 
-            // Legacy top-level windows first (pre-June-2026 schema; five_hour and
-            // seven_day are still populated as of July 2026, seven_day_sonnet is
-            // null but kept as fallback for the old schema).
-            if let w = parseWindow("five_hour", in: json) {
-                sessionUsage = w.usage
-                sessionResetsAt = w.resetsAt ?? sessionResetsAt
-            }
-            if let w = parseWindow("seven_day", in: json) {
-                weeklyUsage = w.usage
-                weeklyResetsAt = w.resetsAt ?? weeklyResetsAt
-            }
-            var scoped: [ScopedWeeklyLimit] = []
-            if let w = parseWindow("seven_day_sonnet", in: json) {
-                scoped = [ScopedWeeklyLimit(name: "Sonnet", percent: w.usage, resetsAt: w.resetsAt)]
-            }
-
-            // June-2026 `limits` array: authoritative when present. Carries the
-            // session/weekly windows plus per-model `weekly_scoped` entries whose
-            // display name comes from the API (e.g. "Fable").
-            if let limits = json["limits"] as? [[String: Any]], !limits.isEmpty {
-                var scopedFromLimits: [ScopedWeeklyLimit] = []
-                for entry in limits {
+            // `limits` array (June 2026): the source of truth. Every entry becomes a
+            // UsageLimit, unknown kinds included.
+            var parsed: [UsageLimit] = []
+            if let entries = json["limits"] as? [[String: Any]], !entries.isEmpty {
+                for entry in entries {
                     guard let kind = entry["kind"] as? String else { continue }
-                    let percent = (entry["percent"] as? NSNumber).map { Int($0.doubleValue.rounded()) } ?? 0
-                    let resetsAt = (entry["resets_at"] as? String).flatMap(UsageManager.parseISODate)
-                    switch kind {
-                    case "session":
-                        sessionUsage = percent
-                        sessionResetsAt = resetsAt ?? sessionResetsAt
-                    case "weekly_all":
-                        weeklyUsage = percent
-                        weeklyResetsAt = resetsAt ?? weeklyResetsAt
-                    case "weekly_scoped":
-                        let model = ((entry["scope"] as? [String: Any])?["model"]) as? [String: Any]
-                        let name = (model?["display_name"] as? String) ?? "Model"
-                        scopedFromLimits.append(ScopedWeeklyLimit(name: name, percent: percent, resetsAt: resetsAt))
-                    default:
-                        break   // unknown future kinds are ignored
+                    let model = ((entry["scope"] as? [String: Any])?["model"]) as? [String: Any]
+                    parsed.append(UsageLimit.make(
+                        kind: kind,
+                        scope: model?["display_name"] as? String,
+                        group: entry["group"] as? String,
+                        percent: (entry["percent"] as? NSNumber).map { Int($0.doubleValue.rounded()) } ?? 0,
+                        resetsAt: (entry["resets_at"] as? String).flatMap(UsageManager.parseISODate)))
+                }
+            } else {
+                // Pre-June-2026 schema: fixed top-level windows.
+                for (key, kind, scope) in [("five_hour", "session", nil), ("seven_day", "weekly_all", nil),
+                                           ("seven_day_sonnet", "weekly_scoped", "Sonnet")] as [(String, String, String?)] {
+                    if let w = parseWindow(key, in: json) {
+                        parsed.append(UsageLimit.make(kind: kind, scope: scope, group: nil,
+                                                      percent: w.usage, resetsAt: w.resetsAt))
                     }
                 }
-                // The array is the source of truth — replace even if it yielded
-                // no scoped entries (means there IS no per-model window anymore).
-                scoped = scopedFromLimits
             }
-            scopedWeekly = scoped
+            // Ids must be unique (they key the settings and the SwiftUI lists).
+            var seen = Set<String>()
+            limits = parsed.filter { seen.insert($0.id).inserted }
+            weeklyUsage = (limits.first { $0.kind == "weekly_all" } ?? limits.first)?.percent ?? 0
 
-            // Log what we found
-            NSLog("✅ Parsed: Session \(sessionUsage)%, Weekly \(weeklyUsage)%\(scopedWeekly.map { ", \($0.name) \($0.percent)%" }.joined())")
+            // One-time hand-over of the old per-model options to the first scoped limit.
+            if let old = limitSettings["legacy_scoped"],
+               let scoped = limits.first(where: { $0.kind == "weekly_scoped" }) {
+                if limitSettings[scoped.id] == nil { limitSettings[scoped.id] = old }
+                limitSettings["legacy_scoped"] = nil
+                saveSettings()
+            }
+
+            NSLog("✅ Parsed: \(limits.map { "\($0.title) \($0.percent)%" }.joined(separator: ", "))")
 
             lastUpdated = Date()
             lastSuccessfulUpdate = Date()
@@ -2083,9 +2108,6 @@ class UsageManager: ObservableObject {
             hasFetchedData = true
             cookieInvalid = false
 
-
-            // Update percentage values for progress bars
-            updatePercentages()
         } catch {
             NSLog("❌ Parse error: \(error.localizedDescription)")
             errorMessage = "Parse error"
@@ -2155,18 +2177,10 @@ class UsageManager: ObservableObject {
         fetchUsage()
     }
 
-    @Published var sessionPercentage: Double = 0.0
-    @Published var weeklyPercentage: Double = 0.0
-
     /// Percent (0–100) → clamped 0–1 fraction for ProgressView (the API can
     /// report slightly over 100 at the cap edge; >1 trips a runtime warning).
     static func fraction(_ percent: Int) -> Double {
         min(max(Double(percent) / 100.0, 0), 1)
-    }
-
-    func updatePercentages() {
-        sessionPercentage = UsageManager.fraction(sessionUsage)
-        weeklyPercentage = UsageManager.fraction(weeklyUsage)
     }
 }
 
@@ -2575,7 +2589,6 @@ struct UsageView: View {
                 usageManager.reportPopoverHeight(value)
             }
             .onAppear {
-                usageManager.updatePercentages()
                 // Re-sync the real login-item status each time the popover opens.
                 usageManager.refreshLoginItemStatus()
             }
@@ -2658,20 +2671,13 @@ struct UsageView: View {
 
             // Usage rows (all share the same layout via usageRow).
             if usageManager.hasFetchedData {
-                usageRow(title: "Weekly (7 day)",
-                         percentage: usageManager.weeklyPercentage,
-                         resetDate: usageManager.weeklyResetsAt,
-                         countdown: usageManager.weeklyResetCountdown,
-                         color: Palette.weekly,
-                         includeDate: true)
-
-                // Per-model weekly windows (e.g. Fable), named by the API.
-                ForEach(usageManager.scopedWeekly) { sw in
-                    usageRow(title: "Weekly \(sw.name) (7 day)",
-                             percentage: UsageManager.fraction(sw.percent),
-                             resetDate: sw.resetsAt,
-                             countdown: UsageManager.countdown(to: sw.resetsAt),
-                             color: Palette.model,
+                // One row per limit the API reports (names come from the API).
+                ForEach(usageManager.limits) { l in
+                    usageRow(title: l.rowTitle,
+                             percentage: UsageManager.fraction(l.percent),
+                             resetDate: l.resetsAt,
+                             countdown: UsageManager.countdown(to: l.resetsAt),
+                             color: Palette.limitColors(l.kind).popover,
                              includeDate: true)
                 }
 
@@ -3121,18 +3127,20 @@ struct UsageView: View {
                     VStack(alignment: .leading, spacing: 8) {
                         Text("Show in menu bar")
                             .font(.caption).fontWeight(.semibold)
-                        barRow("Weekly usage %", Palette.weekly, isPercent: true,
-                               modeGet: { usageManager.weeklyPercentMode }, modeSet: { usageManager.weeklyPercentMode = $0 },
-                               thrGet: { usageManager.weeklyPercentThreshold }, thrSet: { usageManager.weeklyPercentThreshold = $0 })
-                        barRow("Weekly reset timer", Palette.weekly, isPercent: false,
-                               modeGet: { usageManager.weeklyTimerMode }, modeSet: { usageManager.weeklyTimerMode = $0 },
-                               thrGet: { usageManager.weeklyTimerThreshold }, thrSet: { usageManager.weeklyTimerThreshold = $0 })
-                        barRow("Weekly \(usageManager.scopedWeekly.first?.name ?? "model") usage %", Palette.model, isPercent: true,
-                               modeGet: { usageManager.modelPercentMode }, modeSet: { usageManager.modelPercentMode = $0 },
-                               thrGet: { usageManager.modelPercentThreshold }, thrSet: { usageManager.modelPercentThreshold = $0 })
-                        barRow("Weekly \(usageManager.scopedWeekly.first?.name ?? "model") reset timer", Palette.model, isPercent: false,
-                               modeGet: { usageManager.modelTimerMode }, modeSet: { usageManager.modelTimerMode = $0 },
-                               thrGet: { usageManager.modelTimerThreshold }, thrSet: { usageManager.modelTimerThreshold = $0 })
+                        // Two options per limit the API reports; new limits start Off.
+                        ForEach(usageManager.limits) { l in
+                            let color = Palette.limitColors(l.kind).popover
+                            barRow("\(l.title) usage %", color, isPercent: true,
+                                   modeGet: { usageManager.barSettings(for: l.id).percentMode },
+                                   modeSet: { v in usageManager.updateBarSettings(for: l.id) { $0.percentMode = v } },
+                                   thrGet: { usageManager.barSettings(for: l.id).percentThreshold },
+                                   thrSet: { v in usageManager.updateBarSettings(for: l.id) { $0.percentThreshold = v } })
+                            barRow("\(l.title) reset timer", color, isPercent: false,
+                                   modeGet: { usageManager.barSettings(for: l.id).timerMode },
+                                   modeSet: { v in usageManager.updateBarSettings(for: l.id) { $0.timerMode = v } },
+                                   thrGet: { usageManager.barSettings(for: l.id).timerThreshold },
+                                   thrSet: { v in usageManager.updateBarSettings(for: l.id) { $0.timerThreshold = v } })
+                        }
                         barRow("Extra usage credits (Max)", Palette.credits, isPercent: false, moneyCode: usageManager.extraCreditsCurrency,
                                modeGet: { usageManager.extraCreditsMode }, modeSet: { usageManager.extraCreditsMode = $0 },
                                thrGet: { usageManager.extraCreditsThreshold }, thrSet: { usageManager.extraCreditsThreshold = $0 })
