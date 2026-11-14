@@ -250,26 +250,26 @@ enum Palette {
     static let sessionNS = dyn(light: NSColor(srgbRed: 0.11, green: 0.55, blue: 0.24, alpha: 1),  // #1C8C3D
                                dark:  NSColor(srgbRed: 0.18, green: 0.82, blue: 0.35, alpha: 1))  // #30D158
     static let weeklyNS  = dyn(light: NSColor(srgbRed: 0.05, green: 0.42, blue: 0.68, alpha: 1),  // #0D6BAD
-                               dark:  NSColor(srgbRed: 0.35, green: 0.78, blue: 0.98, alpha: 1))  // #5AC8FA
+                               dark:  NSColor(srgbRed: 0.75, green: 0.91, blue: 1.00, alpha: 1))  // #BFE8FF
     static let modelNS   = dyn(light: NSColor(srgbRed: 0.72, green: 0.40, blue: 0.00, alpha: 1),  // #B86600
-                               dark:  NSColor(srgbRed: 1.00, green: 0.62, blue: 0.04, alpha: 1))  // #FF9F0A
+                               dark:  NSColor(srgbRed: 1.00, green: 0.78, blue: 0.36, alpha: 1))  // #FFC75C
     static let alertNS   = dyn(light: NSColor(srgbRed: 0.84, green: 0.00, blue: 0.08, alpha: 1),  // #D60014
                                dark:  NSColor(srgbRed: 1.00, green: 0.23, blue: 0.19, alpha: 1))  // #FF3B30
     static let warnNS    = dyn(light: NSColor(srgbRed: 0.80, green: 0.60, blue: 0.00, alpha: 1),  // #CC9900
                                dark:  NSColor(srgbRed: 1.00, green: 0.80, blue: 0.00, alpha: 1))  // #FFCC00
     static let creditsNS = dyn(light: NSColor(srgbRed: 0.43, green: 0.25, blue: 0.76, alpha: 1),  // #6E3FC2
-                               dark:  NSColor(srgbRed: 0.75, green: 0.35, blue: 0.95, alpha: 1))  // #BF5AF2
+                               dark:  NSColor(srgbRed: 0.95, green: 0.71, blue: 1.00, alpha: 1))  // #F2B5FF
     static let consoleNS = dyn(light: NSColor(srgbRed: 0.04, green: 0.56, blue: 0.43, alpha: 1),  // #0A8F6E
-                               dark:  NSColor(srgbRed: 0.39, green: 0.90, blue: 0.75, alpha: 1))  // #63E6BE
-    static let codexNS   = dyn(light: NSColor(srgbRed: 0.33, green: 0.32, blue: 0.85, alpha: 1),  // #5452D9
-                               dark:  NSColor(srgbRed: 0.55, green: 0.55, blue: 1.00, alpha: 1))  // #8C8CFF
+                               dark:  NSColor(srgbRed: 0.66, green: 0.96, blue: 0.86, alpha: 1))  // #A8F5DC
+    static let codexNS   = dyn(light: NSColor(srgbRed: 0.48, green: 0.42, blue: 0.00, alpha: 1),  // #7A6B00
+                               dark:  NSColor(srgbRed: 1.00, green: 0.94, blue: 0.63, alpha: 1))  // #FFF0A0
 
     static let session = Color(.sRGB, red: 0.13, green: 0.62, blue: 0.27)  // darker #219E45
     static let weekly  = Color(.sRGB, red: 0.10, green: 0.48, blue: 0.75)  // darker #1A7ABF
     static let model   = Color(.sRGB, red: 0.85, green: 0.50, blue: 0.02)  // darker #D98005
     static let credits = Color(.sRGB, red: 0.55, green: 0.31, blue: 0.85)  // darker #8C4FD9
     static let console = Color(.sRGB, red: 0.06, green: 0.61, blue: 0.47)  // darker #0F9B78
-    static let codex   = Color(.sRGB, red: 0.37, green: 0.36, blue: 0.90)  // darker #5E5CE6
+    static let codex   = Color(.sRGB, red: 0.60, green: 0.52, blue: 0.00)  // dark gold #998500
     static let alert   = Color(.sRGB, red: 1.00, green: 0.23, blue: 0.19)
 
     /// Linear sRGB interpolation between two NSColors.
@@ -294,6 +294,9 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
     // Session ring enters the green→red danger ramp above this % used; the ramp
     // spans the remaining `dangerSpan` points up to 100% (full red).
     static let dangerThreshold = 75
+    // The ring now tracks the WEEKLY window: blinking from 75% would go on for days,
+    // so the alarm blink starts later than the red shift.
+    static let blinkThreshold = 90
     static let dangerSpan = CGFloat(100 - dangerThreshold)   // = 25.0 denominator
     static let popoverWidth: CGFloat = 360
 
@@ -630,12 +633,12 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
     /// Session ring color: exactly the primary-% green, ramping to red only in the
     /// final danger zone (>75% used → green→red, full red at 100%).
     func sessionRingColor(_ percent: Int) -> NSColor {
-        if percent <= AppDelegate.dangerThreshold { return Palette.sessionNS }   // same green as the % text
+        if percent <= AppDelegate.dangerThreshold { return Palette.weeklyNS }   // same blue as the weekly % text
         let t = CGFloat(min(1.0, Double(percent - AppDelegate.dangerThreshold) / Double(AppDelegate.dangerSpan)))
         // Dynamic too: lerp the light or dark variants depending on where it's drawn.
         return NSColor(name: nil) { appearance in
-            var c = Palette.sessionNS
-            appearance.performAsCurrentDrawingAppearance { c = Palette.lerp(Palette.sessionNS, Palette.alertNS, t) }
+            var c = Palette.weeklyNS
+            appearance.performAsCurrentDrawingAppearance { c = Palette.lerp(Palette.weeklyNS, Palette.alertNS, t) }
             return c
         }
     }
@@ -652,7 +655,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
     /// Start/stop the 0.1s master blink timer based on whether the session ring is
     /// in the low-quota alarm zone (>75%) or a tracked service is down. Idle otherwise.
     func reconfigureBlink() {
-        let danger = blinkEnabled && lastSessionPercent > AppDelegate.dangerThreshold
+        let danger = blinkEnabled && lastSessionPercent > AppDelegate.blinkThreshold
         let outage = blinkEnabled && statusDotColor() != nil
         if danger || outage {
             if blinkTimer == nil {
@@ -687,7 +690,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
     func drawIcon() {
         guard let button = statusItem.button else { return }
         let percent = lastSessionPercent
-        let dangerActive = blinkEnabled && percent > AppDelegate.dangerThreshold
+        let dangerActive = blinkEnabled && percent > AppDelegate.blinkThreshold
         let drawRing = !(dangerActive && !ringBlinkOn)
         let dot = statusDotColor()
         let drawDot = dot != nil && !(blinkEnabled && !statusBlinkOn)
@@ -705,23 +708,30 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
     /// Differentiated by color (no letter tags). Extras are behind Settings toggles.
     func menuBarTitle() -> NSAttributedString {
         let s = NSMutableAttributedString()
+        // On a dark (wallpaper-tinted) bar a soft dark halo keeps colored text legible
+        // whatever shows through; on a light bar it would only smudge.
+        var attrs: [NSAttributedString.Key: Any] = [:]
+        if statusItem.button?.effectiveAppearance.bestMatch(from: [.aqua, .darkAqua]) == .darkAqua {
+            let halo = NSShadow()
+            halo.shadowColor = NSColor.black.withAlphaComponent(0.55)
+            halo.shadowBlurRadius = 2
+            halo.shadowOffset = NSSize(width: 0, height: -0.5)
+            attrs[.shadow] = halo
+        }
         func seg(_ text: String, _ color: NSColor) {
-            s.append(NSAttributedString(string: text, attributes: [.foregroundColor: color]))
+            var a = attrs
+            a[.foregroundColor] = color
+            s.append(NSAttributedString(string: text, attributes: a))
         }
         guard let um = usageManager else { return NSAttributedString(string: " \(lastSessionPercent)%") }
 
-        // Session: % and timer are independent toggles (% is on by default).
-        var sessionParts: [String] = []
-        if um.showSessionPercent { sessionParts.append("\(lastSessionPercent)%") }
-        if um.showSessionTimer, let t = um.sessionResetCountdown { sessionParts.append(t) }
-        if !sessionParts.isEmpty { seg(" " + sessionParts.joined(separator: " "), Palette.sessionNS) }
 
         // Weekly: % and timer are independent toggles.
         if um.showWeeklyPercent || um.showWeeklyTimer {
             var parts: [String] = []
             if um.showWeeklyPercent { parts.append("\(um.weeklyUsage)%") }
             if um.showWeeklyTimer, let t = um.weeklyResetCountdown { parts.append(t) }
-            if !parts.isEmpty { seg("  " + parts.joined(separator: " "), Palette.weeklyNS) }
+            if !parts.isEmpty { seg(" " + parts.joined(separator: " "), Palette.weeklyNS) }
         }
         // Per-model window: % and timer are independent toggles, same as Weekly.
         if let sw = um.scopedWeekly.first, um.showModelPercent || um.showModelTimer {
@@ -924,8 +934,6 @@ class UsageManager: ObservableObject {
 
     // Menu-bar display modes per extra value (default: Off → only primary %).
     // % thresholds mean "show if ≥ N%"; timer thresholds mean "show if reset ≤ N min".
-    @Published var sessionPercentMode: BarMode = .always   // the base value; on by default
-    @Published var sessionPercentThreshold: Int = 50    // percent
     @Published var sessionTimerMode: BarMode = .off
     @Published var sessionTimerThreshold: Int = 60      // minutes
     @Published var weeklyPercentMode: BarMode = .off
@@ -1023,7 +1031,6 @@ class UsageManager: ObservableObject {
     }
     var showConsoleBonus: Bool { showMoney(mode: consoleMode, minor: consolePromoMinor, threshold: consoleThreshold) }
     var showConsolePurchased: Bool { showMoney(mode: consolePurchasedMode, minor: consolePurchasedMinor, threshold: consolePurchasedThreshold) }
-    var showSessionPercent: Bool { showPercent(mode: sessionPercentMode, value: sessionUsage, threshold: sessionPercentThreshold) }
     var showCodexPercent: Bool {
         guard let w = codexWindows.first else { return false }
         return showPercent(mode: codexPercentMode, value: w.percent, threshold: codexPercentThreshold)
@@ -1061,8 +1068,6 @@ class UsageManager: ObservableObject {
         return Date().timeIntervalSince(last) > staleThresholdSeconds
     }
     // Tracks the last session % we saw, to detect a reset (high -> ~0).
-    private var previousSessionUsage: Int = 0
-    private var notifiedResetSoon: Bool = false
 
     private var statusItem: NSStatusItem?
     private var sessionCookie: String = ""
@@ -1152,7 +1157,8 @@ class UsageManager: ObservableObject {
         let d = UserDefaults.standard
         // Int rawValue persistence keeps backward compatibility with saved 0/1/2 values.
         sessionTimerMode = BarMode(rawValue: d.integer(forKey: "session_timer_mode")) ?? .off
-        weeklyPercentMode = BarMode(rawValue: d.integer(forKey: "weekly_percent_mode")) ?? .off
+        weeklyPercentMode = d.object(forKey: "weekly_percent_mode") == nil ? .always
+            : BarMode(rawValue: d.integer(forKey: "weekly_percent_mode")) ?? .off
         weeklyTimerMode = BarMode(rawValue: d.integer(forKey: "weekly_timer_mode")) ?? .off
         modelPercentMode = BarMode(rawValue: d.integer(forKey: "sonnet_percent_mode")) ?? .off
         modelTimerMode = BarMode(rawValue: d.integer(forKey: "model_timer_mode")) ?? .off
@@ -1166,9 +1172,6 @@ class UsageManager: ObservableObject {
         consoleMode = BarMode(rawValue: d.integer(forKey: "console_mode")) ?? .off
         consolePurchasedMode = BarMode(rawValue: d.integer(forKey: "console_purchased_mode")) ?? .off
         if d.object(forKey: "console_purchased_thr") != nil { consolePurchasedThreshold = d.integer(forKey: "console_purchased_thr") }
-        // Absent key = Always: the session % has always been shown.
-        if d.object(forKey: "session_percent_mode") != nil { sessionPercentMode = BarMode(rawValue: d.integer(forKey: "session_percent_mode")) ?? .always }
-        if d.object(forKey: "session_percent_thr") != nil { sessionPercentThreshold = d.integer(forKey: "session_percent_thr") }
         if d.object(forKey: "console_thr") != nil { consoleThreshold = d.integer(forKey: "console_thr") }
         snapshotDirectory = d.string(forKey: "snapshot_dir") ?? ""
         codexPercentMode = BarMode(rawValue: d.integer(forKey: "codex_percent_mode")) ?? .off
@@ -1206,8 +1209,6 @@ class UsageManager: ObservableObject {
         d.set(consoleThreshold, forKey: "console_thr")
         d.set(consolePurchasedMode.rawValue, forKey: "console_purchased_mode")
         d.set(consolePurchasedThreshold, forKey: "console_purchased_thr")
-        d.set(sessionPercentMode.rawValue, forKey: "session_percent_mode")
-        d.set(sessionPercentThreshold, forKey: "session_percent_thr")
         d.set(codexPercentMode.rawValue, forKey: "codex_percent_mode")
         d.set(codexPercentThreshold, forKey: "codex_percent_thr")
         d.set(codexTimerMode.rawValue, forKey: "codex_timer_mode")
@@ -1800,7 +1801,6 @@ class UsageManager: ObservableObject {
         // "- <name> (<duration>): <N>% used, resets <ISO>"; a missing value stays on
         // its line as "unknown" instead of the line disappearing.
         let known = hasFetchedData
-        out.append("- Session (5 h): \(known ? "\(sessionUsage)" : "unknown")% used, resets \(when(sessionResetsAt))")
         out.append("- Weekly, all models (7 d): \(known ? "\(weeklyUsage)" : "unknown")% used, resets \(when(weeklyResetsAt))")
         for sw in scopedWeekly {
             out.append("- Weekly \(sw.name) (7 d): \(sw.percent)% used, resets \(when(sw.resetsAt))")
@@ -2083,12 +2083,6 @@ class UsageManager: ObservableObject {
             hasFetchedData = true
             cookieInvalid = false
 
-            // Detect a session reset (usage was high, now dropped near zero) and
-            // notify once so you know you're back to a full 5-hour window.
-            checkSessionReset(newUsage: sessionUsage)
-            // Notify when the reset is imminent (so you can wrap up before the cap).
-            checkResetImminent()
-            previousSessionUsage = sessionUsage
 
             // Update percentage values for progress bars
             updatePercentages()
@@ -2099,8 +2093,9 @@ class UsageManager: ObservableObject {
     }
 
     func updateStatusBar() {
-        // sessionUsage is already a percent (0–100).
-        let sessionPercent = sessionUsage
+        // The 5-hour session window is gone from the API (Nov 2026): the ring and the
+        // threshold notifications follow the weekly window. Already a percent (0–100).
+        let sessionPercent = weeklyUsage
 
         // Update the icon color
         delegate?.updateStatusIcon(percentage: sessionPercent)
@@ -2144,41 +2139,15 @@ class UsageManager: ObservableObject {
 
     func sendNotification(percentage: Int, threshold: Int) {
         Notifier.post(title: "AIMeter — usage alert",
-                      body: "You've reached \(percentage)% of your 5-hour session limit")
+                      body: "You've reached \(percentage)% of your weekly limit")
         NSLog("📬 Sent notification for \(threshold)% threshold")
     }
 
     func sendTestNotification() {
         NSLog("🔔 Test notification button clicked")
         Notifier.post(title: "AIMeter — usage alert",
-                      body: "Test notification — You've reached 75% of your 5-hour session limit")
+                      body: "Test notification — You've reached 75% of your weekly limit")
         NSLog("📬 Test notification sent successfully")
-    }
-
-    /// Session reset just happened: usage was meaningfully high and dropped to ~0.
-    private func checkSessionReset(newUsage: Int) {
-        guard usageNotificationsEnabled else { return }
-        if previousSessionUsage >= 50 && newUsage <= 5 {
-            Notifier.post(title: "AIMeter — session reset",
-                          body: "Your 5-hour session limit just reset — you're back to full capacity.")
-            NSLog("📬 Session reset notification sent")
-            notifiedResetSoon = false   // allow a fresh "imminent" alert next cycle
-        }
-    }
-
-    /// Reset is imminent (within 10 min) while usage is high: notify once per window.
-    private func checkResetImminent() {
-        guard usageNotificationsEnabled, let resetsAt = sessionResetsAt else { return }
-        let secondsLeft = resetsAt.timeIntervalSinceNow
-        if secondsLeft > 0 && secondsLeft <= 10 * 60 && sessionUsage >= 50 && !notifiedResetSoon {
-            let mins = max(1, Int(secondsLeft / 60))
-            Notifier.post(title: "AIMeter — session resets soon",
-                          body: "About \(mins) min left before your 5-hour window resets (now at \(sessionUsage)%).")
-            NSLog("📬 Reset-imminent notification sent (\(mins) min)")
-            notifiedResetSoon = true
-        }
-        // Re-arm: once we're comfortably far from the reset, allow the next imminent alert.
-        if secondsLeft > 10 * 60 { notifiedResetSoon = false }
     }
 
     /// Public entry for the manual "Refresh now" button.
@@ -2689,12 +2658,6 @@ struct UsageView: View {
 
             // Usage rows (all share the same layout via usageRow).
             if usageManager.hasFetchedData {
-                usageRow(title: "Session (5 hour)",
-                         percentage: usageManager.sessionPercentage,
-                         resetDate: usageManager.sessionResetsAt,
-                         countdown: usageManager.sessionResetCountdown,
-                         color: Palette.session)
-
                 usageRow(title: "Weekly (7 day)",
                          percentage: usageManager.weeklyPercentage,
                          resetDate: usageManager.weeklyResetsAt,
@@ -3158,12 +3121,6 @@ struct UsageView: View {
                     VStack(alignment: .leading, spacing: 8) {
                         Text("Show in menu bar")
                             .font(.caption).fontWeight(.semibold)
-                        barRow("Session usage %", Palette.session, isPercent: true,
-                               modeGet: { usageManager.sessionPercentMode }, modeSet: { usageManager.sessionPercentMode = $0 },
-                               thrGet: { usageManager.sessionPercentThreshold }, thrSet: { usageManager.sessionPercentThreshold = $0 })
-                        barRow("Session reset timer", Palette.session, isPercent: false,
-                               modeGet: { usageManager.sessionTimerMode }, modeSet: { usageManager.sessionTimerMode = $0 },
-                               thrGet: { usageManager.sessionTimerThreshold }, thrSet: { usageManager.sessionTimerThreshold = $0 })
                         barRow("Weekly usage %", Palette.weekly, isPercent: true,
                                modeGet: { usageManager.weeklyPercentMode }, modeSet: { usageManager.weeklyPercentMode = $0 },
                                thrGet: { usageManager.weeklyPercentThreshold }, thrSet: { usageManager.weeklyPercentThreshold = $0 })
@@ -3213,7 +3170,7 @@ struct UsageView: View {
                             VStack(alignment: .leading, spacing: 2) {
                                 Text("Enable Usage Notifications")
                                     .font(.caption)
-                                Text("Get alerts at 25%, 50%, 75%,\nand 90% session usage")
+                                Text("Get alerts at 25%, 50%, 75%,\nand 90% weekly usage")
                                     .font(.caption2)
                                     .foregroundColor(.secondary)
                                     .fixedSize(horizontal: false, vertical: true)
