@@ -261,12 +261,15 @@ enum Palette {
                                dark:  NSColor(srgbRed: 0.75, green: 0.35, blue: 0.95, alpha: 1))  // #BF5AF2
     static let consoleNS = dyn(light: NSColor(srgbRed: 0.04, green: 0.56, blue: 0.43, alpha: 1),  // #0A8F6E
                                dark:  NSColor(srgbRed: 0.39, green: 0.90, blue: 0.75, alpha: 1))  // #63E6BE
+    static let codexNS   = dyn(light: NSColor(srgbRed: 0.33, green: 0.32, blue: 0.85, alpha: 1),  // #5452D9
+                               dark:  NSColor(srgbRed: 0.55, green: 0.55, blue: 1.00, alpha: 1))  // #8C8CFF
 
     static let session = Color(.sRGB, red: 0.13, green: 0.62, blue: 0.27)  // darker #219E45
     static let weekly  = Color(.sRGB, red: 0.10, green: 0.48, blue: 0.75)  // darker #1A7ABF
     static let model   = Color(.sRGB, red: 0.85, green: 0.50, blue: 0.02)  // darker #D98005
     static let credits = Color(.sRGB, red: 0.55, green: 0.31, blue: 0.85)  // darker #8C4FD9
     static let console = Color(.sRGB, red: 0.06, green: 0.61, blue: 0.47)  // darker #0F9B78
+    static let codex   = Color(.sRGB, red: 0.37, green: 0.36, blue: 0.90)  // darker #5E5CE6
     static let alert   = Color(.sRGB, red: 1.00, green: 0.23, blue: 0.19)
 
     /// Linear sRGB interpolation between two NSColors.
@@ -313,8 +316,6 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
     var blinkTick: Int = 0
     var ringBlinkOn: Bool = true     // blink phase of the session ring (low-quota alarm)
     var statusBlinkOn: Bool = true   // blink phase of the center status dot (outage)
-    var appearanceObservation: NSKeyValueObservation?  // menu bar light/dark flips
-    var lastDrawnIsDark: Bool?       // appearance the icon was last baked for (loop guard)
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         // NSUserNotification (deprecated but works without permissions for unsigned apps)
@@ -339,19 +340,11 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
 
             // The ring icon is a baked bitmap: re-render it when the menu bar
             // flips light/dark (the title's dynamic colors update on their own).
-            // KVO also fires when AppKit re-sets an UNCHANGED appearance while it
-            // redraws the status item — and drawIcon() itself schedules that redraw,
-            // so reacting unconditionally is an infinite redraw loop (~95% CPU,
-            // seen on macOS 27). Redraw only on a real light/dark flip.
-            appearanceObservation = button.observe(\.effectiveAppearance) { [weak self] button, _ in
-                let isDark = AppDelegate.isDark(button.effectiveAppearance)
-                DispatchQueue.main.async {
-                    MainActor.assumeIsolated {
-                        guard let self = self, self.lastDrawnIsDark != isDark else { return }
-                        self.drawIcon()
-                    }
-                }
-            }
+            // No appearance observer: the ring icon draws lazily (drawingHandler), so
+            // its dynamic colors resolve against the menu bar's light/dark at render
+            // time. An effectiveAppearance KVO observer that redrew the icon caused an
+            // infinite redraw loop (~95% CPU on macOS 27): AppKit toggles the button's
+            // appearance while rendering the status item, and every redraw re-fired it.
         }
 
         // Initialize managers
@@ -639,7 +632,12 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
     func sessionRingColor(_ percent: Int) -> NSColor {
         if percent <= AppDelegate.dangerThreshold { return Palette.sessionNS }   // same green as the % text
         let t = CGFloat(min(1.0, Double(percent - AppDelegate.dangerThreshold) / Double(AppDelegate.dangerSpan)))
-        return Palette.lerp(Palette.sessionNS, Palette.alertNS, t)
+        // Dynamic too: lerp the light or dark variants depending on where it's drawn.
+        return NSColor(name: nil) { appearance in
+            var c = Palette.sessionNS
+            appearance.performAsCurrentDrawingAppearance { c = Palette.lerp(Palette.sessionNS, Palette.alertNS, t) }
+            return c
+        }
     }
 
     /// Center status-dot color from the (filtered) service indicator. nil = no dot.
@@ -694,21 +692,13 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         let dot = statusDotColor()
         let drawDot = dot != nil && !(blinkEnabled && !statusBlinkOn)
 
-        // The icon is a baked bitmap, so dynamic Palette colors must be resolved
-        // here against the menu bar's actual appearance (light vs dark). The
-        // attributed title keeps the dynamic colors and resolves at draw time.
-        button.effectiveAppearance.performAsCurrentDrawingAppearance {
-            button.image = createRingIcon(percentage: percent,
-                                          color: sessionRingColor(percent),
-                                          drawRing: drawRing,
-                                          dotColor: drawDot ? dot : nil)
-        }
-        lastDrawnIsDark = AppDelegate.isDark(button.effectiveAppearance)
+        // Icon and title both keep dynamic colors and resolve them at draw time
+        // against the menu bar's actual appearance (light vs dark).
+        button.image = createRingIcon(percentage: percent,
+                                      color: sessionRingColor(percent),
+                                      drawRing: drawRing,
+                                      dotColor: drawDot ? dot : nil)
         button.attributedTitle = menuBarTitle()
-    }
-
-    nonisolated static func isDark(_ appearance: NSAppearance) -> Bool {
-        appearance.bestMatch(from: [.aqua, .darkAqua]) == .darkAqua
     }
 
     /// Colored menu-bar text: session % (+optional bits), then weekly, then per-model.
@@ -740,6 +730,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         // Money balances: Max extra-usage credits, Console API credits.
         if um.showExtraCredits, let t = um.extraCreditsText { seg("  " + t, Palette.creditsNS) }
         if um.showConsoleCredits, let t = um.consoleCreditsText { seg("  " + t, Palette.consoleNS) }
+        if um.showCodexPercent, let w = um.codexWindows.first { seg("  \(w.percent)%", Palette.codexNS) }
         return s
     }
 
@@ -748,13 +739,14 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
     /// (if `dotColor` set) flags a service disruption.
     func createRingIcon(percentage: Int, color: NSColor, drawRing: Bool = true, dotColor: NSColor? = nil) -> NSImage {
         let size = NSSize(width: 16, height: 16)
-        let image = NSImage(size: size)
         let center = NSPoint(x: 8, y: 8)
         let radius: CGFloat = 6
         let lineWidth: CGFloat = 2.4
         let fraction = max(0.0, min(1.0, Double(percentage) / 100.0))
 
-        image.lockFocus()
+        // Drawn lazily by AppKit in the current appearance, so dynamic colors pick
+        // the light or dark menu-bar variant on their own (no observer needed).
+        let image = NSImage(size: size, flipped: false) { _ in
 
         if drawRing {
             // Faint full track so an empty/low ring is still visible.
@@ -801,7 +793,8 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
             dot.fill()
         }
 
-        image.unlockFocus()
+            return true
+        }
         image.isTemplate = false
         return image
     }
@@ -840,6 +833,20 @@ struct ScopedWeeklyLimit: Equatable, Identifiable {
 ///   • usage notifications (per-threshold, session-reset, reset-imminent),
 ///   • the conditional menu-bar visibility logic (show* computed properties).
 /// Network callbacks marshal back to the main thread before mutating @Published state.
+/// One Codex rate-limit window (free plan: a single 30-day window; paid plans add
+/// a 5-hour primary + weekly secondary).
+struct CodexWindow: Equatable {
+    let percent: Int
+    let windowMinutes: Int
+    let resetsAt: Date?
+
+    /// "5 hour", "7 day", "30 day"…
+    var label: String {
+        windowMinutes % 1440 == 0 ? "\(windowMinutes / 1440) day"
+            : windowMinutes % 60 == 0 ? "\(windowMinutes / 60) hour" : "\(windowMinutes) min"
+    }
+}
+
 /// One prepaid-credit tranche as the Console reports it (purchased or promotional).
 /// Kept per tranche so the export can show exactly how much promo is left and when
 /// it expires — a single sum would hide that.
@@ -925,6 +932,14 @@ class UsageManager: ObservableObject {
     @Published var consoleThreshold: Int = 20               // whole currency units: show when balance ≤
     @Published var snapshotDirectory: String = ""           // "" = default (Application Support/AIMeter)
 
+    // OpenAI Codex quota (fork), read from the local `codex` CLI. nil = not fetched.
+    @Published var codexWindows: [CodexWindow] = []         // primary (+ secondary when the plan has one)
+    @Published var codexPlan: String?
+    @Published var codexError: String?
+    @Published var codexPercentMode: BarMode = .off
+    @Published var codexPercentThreshold: Int = 80
+    private var codexFetching = false
+
     private func minutesUntil(_ date: Date?) -> Int? {
         guard let date = date else { return nil }
         let s = Int(date.timeIntervalSinceNow)
@@ -968,6 +983,10 @@ class UsageManager: ObservableObject {
         case .when:   return minor <= consoleThreshold * 100
         case .off:    return false
         }
+    }
+    var showCodexPercent: Bool {
+        guard let w = codexWindows.first else { return false }
+        return showPercent(mode: codexPercentMode, value: w.percent, threshold: codexPercentThreshold)
     }
     var consoleCreditsText: String? {
         consoleCreditsMinor.map { UsageManager.formatMoney(minor: $0, currency: consoleCurrency) }
@@ -1109,6 +1128,8 @@ class UsageManager: ObservableObject {
         consoleMode = BarMode(rawValue: d.integer(forKey: "console_mode")) ?? .off
         if d.object(forKey: "console_thr") != nil { consoleThreshold = d.integer(forKey: "console_thr") }
         snapshotDirectory = d.string(forKey: "snapshot_dir") ?? ""
+        codexPercentMode = BarMode(rawValue: d.integer(forKey: "codex_percent_mode")) ?? .off
+        if d.object(forKey: "codex_percent_thr") != nil { codexPercentThreshold = d.integer(forKey: "codex_percent_thr") }
         blinkEnabled = d.object(forKey: "blink_enabled") == nil ? true : d.bool(forKey: "blink_enabled")
         // Default shortcut to enabled if not previously set
         if UserDefaults.standard.object(forKey: "shortcut_enabled") == nil {
@@ -1138,6 +1159,8 @@ class UsageManager: ObservableObject {
         d.set(extraCreditsThreshold, forKey: "extra_credits_thr")
         d.set(consoleMode.rawValue, forKey: "console_mode")
         d.set(consoleThreshold, forKey: "console_thr")
+        d.set(codexPercentMode.rawValue, forKey: "codex_percent_mode")
+        d.set(codexPercentThreshold, forKey: "codex_percent_thr")
         d.set(blinkEnabled, forKey: "blink_enabled")
     }
 
@@ -1378,8 +1401,10 @@ class UsageManager: ObservableObject {
         // Documented invariant (see file header): callers are on the main thread.
         dispatchPrecondition(condition: .onQueue(.main))
 
-        // The Console balance has its own cookie: fetch it regardless of the claude.ai one.
+        // The Console balance has its own cookie and Codex its own CLI login: fetch
+        // both regardless of the claude.ai cookie.
         fetchConsoleCredits()
+        fetchCodexUsage()
 
         guard !sessionCookie.isEmpty else {
             self.errorMessage = "Session cookie not set"
@@ -1551,6 +1576,117 @@ class UsageManager: ObservableObject {
         vlog("💳 Console credits: \(amount.intValue) \(consoleCurrency) (purchased \(consolePurchasedMinor), promo \(consolePromoMinor))")
     }
 
+    // MARK: - OpenAI Codex quota (fork)
+    //
+    // The `codex` CLI exposes its own account state over JSON-RPC on stdio
+    // (`codex app-server`, method `account/rateLimits/read`), authenticating and
+    // refreshing with its own login — AIMeter never reads ~/.codex/auth.json. One
+    // short-lived process per refresh; killed after the reply or a 20 s timeout.
+
+    /// The app may start at login with a minimal PATH, so look in the usual places.
+    nonisolated static func codexExecutable() -> String? {
+        let home = FileManager.default.homeDirectoryForCurrentUser.path
+        let candidates = ["/opt/homebrew/bin/codex", "/usr/local/bin/codex",
+                          "\(home)/.local/bin/codex", "\(home)/.npm-global/bin/codex"]
+        return candidates.first { FileManager.default.isExecutableFile(atPath: $0) }
+    }
+
+    func fetchCodexUsage() {
+        guard !codexFetching else { return }
+        guard let exe = UsageManager.codexExecutable() else {
+            if codexWindows.isEmpty { codexError = nil }   // not installed: stay silent
+            return
+        }
+        codexFetching = true
+        DispatchQueue.global(qos: .utility).async {
+            let result = UsageManager.runCodexRateLimits(executable: exe)
+            Task { @MainActor in
+                self.codexFetching = false
+                switch result {
+                case .success(let json):
+                    self.parseCodexRateLimits(json)
+                    self.writeSnapshotFile()
+                case .failure(let message):
+                    NSLog("❌ Codex usage: \(message)")
+                    self.codexError = message
+                }
+                self.updateStatusBar()
+            }
+        }
+    }
+
+    enum CodexResult { case success([String: Any]); case failure(String) }
+
+    /// Blocking JSON-RPC round trip; call off the main thread. Returns `result` of
+    /// `account/rateLimits/read`.
+    nonisolated static func runCodexRateLimits(executable: String) -> CodexResult {
+        let proc = Process()
+        proc.executableURL = URL(fileURLWithPath: executable)
+        proc.arguments = ["app-server"]
+        let stdin = Pipe(), stdout = Pipe()
+        proc.standardInput = stdin
+        proc.standardOutput = stdout
+        proc.standardError = FileHandle.nullDevice
+        do { try proc.run() } catch { return .failure("cannot start codex") }
+        defer { if proc.isRunning { proc.terminate() } }
+
+        let requests = [
+            #"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"clientInfo":{"name":"aimeter","version":"1"}}}"#,
+            #"{"jsonrpc":"2.0","method":"initialized"}"#,
+            #"{"jsonrpc":"2.0","id":2,"method":"account/rateLimits/read"}"#,
+        ]
+        stdin.fileHandleForWriting.write((requests.joined(separator: "\n") + "\n").data(using: .utf8)!)
+
+        // Read newline-delimited JSON until our id 2 arrives (or timeout).
+        let reader = stdout.fileHandleForReading
+        let deadline = Date().addingTimeInterval(20)
+        var buffer = Data()
+        var answer: CodexResult = .failure("codex timed out")
+        let done = DispatchSemaphore(value: 0)
+        reader.readabilityHandler = { h in
+            let chunk = h.availableData
+            if chunk.isEmpty { h.readabilityHandler = nil; done.signal(); return }
+            buffer.append(chunk)
+            while let nl = buffer.firstIndex(of: 0x0A) {
+                let line = buffer[buffer.startIndex..<nl]
+                buffer.removeSubrange(buffer.startIndex...nl)
+                guard let msg = try? JSONSerialization.jsonObject(with: line) as? [String: Any],
+                      (msg["id"] as? NSNumber)?.intValue == 2 else { continue }
+                if let r = msg["result"] as? [String: Any] {
+                    answer = .success(r)
+                } else {
+                    let e = (msg["error"] as? [String: Any])?["message"] as? String
+                    answer = .failure(e ?? "codex error")
+                }
+                h.readabilityHandler = nil
+                done.signal()
+                return
+            }
+        }
+        _ = done.wait(timeout: .now() + deadline.timeIntervalSinceNow)
+        reader.readabilityHandler = nil
+        return answer
+    }
+
+    func parseCodexRateLimits(_ r: [String: Any]) {
+        guard let limits = r["rateLimits"] as? [String: Any] else {
+            codexError = "Not logged in to Codex"
+            return
+        }
+        func window(_ key: String) -> CodexWindow? {
+            guard let w = limits[key] as? [String: Any],
+                  let pct = w["usedPercent"] as? NSNumber else { return nil }
+            let reset = (w["resetsAt"] as? NSNumber).map { Date(timeIntervalSince1970: $0.doubleValue) }
+            return CodexWindow(percent: Int(pct.doubleValue.rounded()),
+                               windowMinutes: (w["windowDurationMins"] as? NSNumber)?.intValue ?? 0,
+                               resetsAt: reset)
+        }
+        codexWindows = [window("primary"), window("secondary")].compactMap { $0 }
+        codexPlan = limits["planType"] as? String
+        codexError = codexWindows.isEmpty ? "No Codex limits reported" : nil
+        vlog("🤖 Codex: \(codexWindows.map { "\($0.percent)%/\($0.label)" }) plan \(codexPlan ?? "?")")
+    }
+
     /// Tranche list as the Console sends it (`tranches` / `promo_tranches`).
     nonisolated static func parseTranches(_ raw: [[String: Any]]) -> [CreditTranche] {
         raw.compactMap { t in
@@ -1617,6 +1753,16 @@ class UsageManager: ObservableObject {
             if consolePromoTranches.isEmpty { out.append("  - none") }
         } else {
             out.append("- Not available\(consoleCreditsError.map { " (\($0))" } ?? "")")
+        }
+        out.append("")
+        out.append("## OpenAI Codex (local codex CLI login, percent of window used)")
+        if codexWindows.isEmpty {
+            out.append("- Not available\(codexError.map { " (\($0))" } ?? " (codex CLI not installed)")")
+        } else {
+            out.append("- Plan: \(codexPlan ?? "unknown")")
+            for w in codexWindows {
+                out.append("- Window (\(w.label)): \(w.percent)% used, resets \(when(w.resetsAt))")
+            }
         }
         out.append("")
         out.append("Data last fetched: \(iso.string(from: lastUpdated)). A fresh copy of this snapshot is rewritten after every refresh at \(snapshotURL.path).")
@@ -2514,6 +2660,20 @@ struct UsageView: View {
                     .font(.caption).foregroundColor(.secondary)
             }
 
+            // OpenAI Codex quota (fork), from the local codex CLI login.
+            ForEach(Array(usageManager.codexWindows.enumerated()), id: \.offset) { _, w in
+                usageRow(title: "Codex \(usageManager.codexPlan.map { "\($0) " } ?? "")(\(w.label))",
+                         percentage: UsageManager.fraction(w.percent),
+                         resetDate: w.resetsAt,
+                         countdown: UsageManager.countdown(to: w.resetsAt),
+                         color: Palette.codex,
+                         includeDate: true)
+            }
+            if usageManager.codexWindows.isEmpty, let err = usageManager.codexError {
+                Text("Codex: \(err)")
+                    .font(.caption).foregroundColor(.secondary)
+            }
+
             if statusManager.hasFetched {
                 Divider()
             }
@@ -2943,6 +3103,9 @@ struct UsageView: View {
                         barRow("API credits (Console)", Palette.console, isPercent: false, moneyCode: usageManager.consoleCurrency,
                                modeGet: { usageManager.consoleMode }, modeSet: { usageManager.consoleMode = $0 },
                                thrGet: { usageManager.consoleThreshold }, thrSet: { usageManager.consoleThreshold = $0 })
+                        barRow("Codex usage %", Palette.codex, isPercent: true,
+                               modeGet: { usageManager.codexPercentMode }, modeSet: { usageManager.codexPercentMode = $0 },
+                               thrGet: { usageManager.codexPercentThreshold }, thrSet: { usageManager.codexPercentThreshold = $0 })
                         Toggle(isOn: Binding(
                             get: { usageManager.blinkEnabled },
                             set: { usageManager.blinkEnabled = $0; usageManager.applyMenuBarSettings() }
