@@ -710,8 +710,11 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         }
         guard let um = usageManager else { return NSAttributedString(string: " \(lastSessionPercent)%") }
 
-        seg(" \(lastSessionPercent)%", Palette.sessionNS)
-        if um.showSessionTimer, let t = um.sessionResetCountdown { seg(" \(t)", Palette.sessionNS) }
+        // Session: % and timer are independent toggles (% is on by default).
+        var sessionParts: [String] = []
+        if um.showSessionPercent { sessionParts.append("\(lastSessionPercent)%") }
+        if um.showSessionTimer, let t = um.sessionResetCountdown { sessionParts.append(t) }
+        if !sessionParts.isEmpty { seg(" " + sessionParts.joined(separator: " "), Palette.sessionNS) }
 
         // Weekly: % and timer are independent toggles.
         if um.showWeeklyPercent || um.showWeeklyTimer {
@@ -729,7 +732,11 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         }
         // Money balances: Max extra-usage credits, Console API credits.
         if um.showExtraCredits, let t = um.extraCreditsText { seg("  " + t, Palette.creditsNS) }
-        if um.showConsoleCredits, let t = um.consoleCreditsText { seg("  " + t, Palette.consoleNS) }
+        // Console: purchased credits, then the promotional bonus marked with "+".
+        var consoleParts: [String] = []
+        if um.showConsolePurchased { consoleParts.append(UsageManager.formatMoney(minor: um.consolePurchasedMinor, currency: um.consoleCurrency)) }
+        if um.showConsoleBonus { consoleParts.append("+" + UsageManager.formatMoney(minor: um.consolePromoMinor, currency: um.consoleCurrency)) }
+        if !consoleParts.isEmpty { seg("  " + consoleParts.joined(separator: " "), Palette.consoleNS) }
         // Codex: % and timer are independent toggles, same as Weekly.
         if let w = um.codexWindows.first, um.showCodexPercent || um.showCodexTimer {
             var parts: [String] = []
@@ -902,6 +909,8 @@ class UsageManager: ObservableObject {
 
     // Menu-bar display modes per extra value (default: Off → only primary %).
     // % thresholds mean "show if ≥ N%"; timer thresholds mean "show if reset ≤ N min".
+    @Published var sessionPercentMode: BarMode = .always   // the base value; on by default
+    @Published var sessionPercentThreshold: Int = 50    // percent
     @Published var sessionTimerMode: BarMode = .off
     @Published var sessionTimerThreshold: Int = 60      // minutes
     @Published var weeklyPercentMode: BarMode = .off
@@ -936,7 +945,9 @@ class UsageManager: ObservableObject {
     @Published var consoleCurrency: String = "USD"
     @Published var consoleCreditsError: String?
     @Published var consoleMode: BarMode = .off
-    @Published var consoleThreshold: Int = 20               // whole currency units: show when balance ≤
+    @Published var consoleThreshold: Int = 20               // bonus: show when ≤ (whole currency units)
+    @Published var consolePurchasedMode: BarMode = .off
+    @Published var consolePurchasedThreshold: Int = 20      // purchased: show when ≤
     @Published var snapshotDirectory: String = ""           // "" = default (Application Support/AIMeter)
 
     // OpenAI Codex quota (fork), read from the local `codex` CLI. nil = not fetched.
@@ -985,29 +996,24 @@ class UsageManager: ObservableObject {
     var extraCreditsText: String? {
         extraCreditsMinor.map { UsageManager.formatMoney(minor: $0, currency: extraCreditsCurrency) }
     }
-    /// The Console figure shown in evidence (popover headline, menu bar, threshold):
-    /// the promotional bonus alone when there is one — it expires and is spent
-    /// first — otherwise the whole balance.
-    var consoleHeadlineMinor: Int? {
-        guard let total = consoleCreditsMinor else { return nil }
-        return consolePromoTranches.isEmpty ? total : consolePromoMinor
-    }
-    var showConsoleCredits: Bool {
-        guard let minor = consoleHeadlineMinor else { return false }
-        switch consoleMode {
+    // Console money in the menu bar: promotional bonus and purchased credits are
+    // two independent values, each with its own mode/threshold.
+    private func showMoney(mode: BarMode, minor: Int, threshold: Int) -> Bool {
+        guard consoleCreditsMinor != nil else { return false }
+        switch mode {
         case .always: return true
-        case .when:   return minor <= consoleThreshold * 100
+        case .when:   return minor <= threshold * 100
         case .off:    return false
         }
     }
+    var showConsoleBonus: Bool { showMoney(mode: consoleMode, minor: consolePromoMinor, threshold: consoleThreshold) }
+    var showConsolePurchased: Bool { showMoney(mode: consolePurchasedMode, minor: consolePurchasedMinor, threshold: consolePurchasedThreshold) }
+    var showSessionPercent: Bool { showPercent(mode: sessionPercentMode, value: sessionUsage, threshold: sessionPercentThreshold) }
     var showCodexPercent: Bool {
         guard let w = codexWindows.first else { return false }
         return showPercent(mode: codexPercentMode, value: w.percent, threshold: codexPercentThreshold)
     }
     var showCodexTimer: Bool { showTimer(mode: codexTimerMode, date: codexWindows.first?.resetsAt, threshold: codexTimerThreshold) }
-    var consoleCreditsText: String? {
-        consoleHeadlineMinor.map { UsageManager.formatMoney(minor: $0, currency: consoleCurrency) }
-    }
 
     static func formatMoney(minor: Int, currency: String) -> String {
         let f = NumberFormatter()
@@ -1143,6 +1149,11 @@ class UsageManager: ObservableObject {
         extraCreditsMode = BarMode(rawValue: d.integer(forKey: "extra_credits_mode")) ?? .off
         if d.object(forKey: "extra_credits_thr") != nil { extraCreditsThreshold = d.integer(forKey: "extra_credits_thr") }
         consoleMode = BarMode(rawValue: d.integer(forKey: "console_mode")) ?? .off
+        consolePurchasedMode = BarMode(rawValue: d.integer(forKey: "console_purchased_mode")) ?? .off
+        if d.object(forKey: "console_purchased_thr") != nil { consolePurchasedThreshold = d.integer(forKey: "console_purchased_thr") }
+        // Absent key = Always: the session % has always been shown.
+        if d.object(forKey: "session_percent_mode") != nil { sessionPercentMode = BarMode(rawValue: d.integer(forKey: "session_percent_mode")) ?? .always }
+        if d.object(forKey: "session_percent_thr") != nil { sessionPercentThreshold = d.integer(forKey: "session_percent_thr") }
         if d.object(forKey: "console_thr") != nil { consoleThreshold = d.integer(forKey: "console_thr") }
         snapshotDirectory = d.string(forKey: "snapshot_dir") ?? ""
         codexPercentMode = BarMode(rawValue: d.integer(forKey: "codex_percent_mode")) ?? .off
@@ -1178,6 +1189,10 @@ class UsageManager: ObservableObject {
         d.set(extraCreditsThreshold, forKey: "extra_credits_thr")
         d.set(consoleMode.rawValue, forKey: "console_mode")
         d.set(consoleThreshold, forKey: "console_thr")
+        d.set(consolePurchasedMode.rawValue, forKey: "console_purchased_mode")
+        d.set(consolePurchasedThreshold, forKey: "console_purchased_thr")
+        d.set(sessionPercentMode.rawValue, forKey: "session_percent_mode")
+        d.set(sessionPercentThreshold, forKey: "session_percent_thr")
         d.set(codexPercentMode.rawValue, forKey: "codex_percent_mode")
         d.set(codexPercentThreshold, forKey: "codex_percent_thr")
         d.set(codexTimerMode.rawValue, forKey: "codex_timer_mode")
@@ -3119,6 +3134,9 @@ struct UsageView: View {
                     VStack(alignment: .leading, spacing: 8) {
                         Text("Show in menu bar")
                             .font(.caption).fontWeight(.semibold)
+                        barRow("Session usage %", Palette.session, isPercent: true,
+                               modeGet: { usageManager.sessionPercentMode }, modeSet: { usageManager.sessionPercentMode = $0 },
+                               thrGet: { usageManager.sessionPercentThreshold }, thrSet: { usageManager.sessionPercentThreshold = $0 })
                         barRow("Session reset timer", Palette.session, isPercent: false,
                                modeGet: { usageManager.sessionTimerMode }, modeSet: { usageManager.sessionTimerMode = $0 },
                                thrGet: { usageManager.sessionTimerThreshold }, thrSet: { usageManager.sessionTimerThreshold = $0 })
@@ -3137,6 +3155,9 @@ struct UsageView: View {
                         barRow("Extra usage credits (Max)", Palette.credits, isPercent: false, moneyCode: usageManager.extraCreditsCurrency,
                                modeGet: { usageManager.extraCreditsMode }, modeSet: { usageManager.extraCreditsMode = $0 },
                                thrGet: { usageManager.extraCreditsThreshold }, thrSet: { usageManager.extraCreditsThreshold = $0 })
+                        barRow("API credits (Console)", Palette.console, isPercent: false, moneyCode: usageManager.consoleCurrency,
+                               modeGet: { usageManager.consolePurchasedMode }, modeSet: { usageManager.consolePurchasedMode = $0 },
+                               thrGet: { usageManager.consolePurchasedThreshold }, thrSet: { usageManager.consolePurchasedThreshold = $0 })
                         barRow("API bonus credits (Console)", Palette.console, isPercent: false, moneyCode: usageManager.consoleCurrency,
                                modeGet: { usageManager.consoleMode }, modeSet: { usageManager.consoleMode = $0 },
                                thrGet: { usageManager.consoleThreshold }, thrSet: { usageManager.consoleThreshold = $0 })
@@ -3315,19 +3336,21 @@ struct UsageView: View {
     private func consoleCreditsRow(totalMinor: Int, purchasedMinor: Int, promoMinor: Int,
                                    promoExpires: Date?, currency: String) -> some View {
         let money = { (m: Int) in UsageManager.formatMoney(minor: m, currency: currency) }
-        // Headline = the promotional bonus alone when there is one (it expires and is
-        // spent first); purchased credits and the total move to the detail line.
-        let hasPromo = !usageManager.consolePromoTranches.isEmpty
-        let expiry = promoExpires.map { "expires \(formatShortDate($0)) · " } ?? ""
+        // Two lines, one per kind of money: purchased credits, then the promotional
+        // bonus (spent first, expires). Total in the caption.
+        let expiry = promoExpires.map { " · bonus expires \(formatShortDate($0))" } ?? ""
         return VStack(alignment: .leading, spacing: 4) {
             HStack {
-                Text(hasPromo ? "API bonus credits (Console)" : "API credits (Console)").font(.subheadline)
+                Text("API credits (Console)").font(.subheadline)
                 Spacer()
-                Text("\(money(hasPromo ? promoMinor : totalMinor)) left").font(.caption).foregroundColor(.secondary)
+                Text("\(money(purchasedMinor)) left").font(.caption).foregroundColor(.secondary)
             }
-            Text(hasPromo
-                 ? "Bonus \(expiry)purchased \(money(purchasedMinor)) · total \(money(totalMinor))"
-                 : "Purchased \(money(purchasedMinor))")
+            HStack {
+                Text("API bonus credits (Console)").font(.subheadline)
+                Spacer()
+                Text("\(money(promoMinor)) left").font(.caption).foregroundColor(.secondary)
+            }
+            Text("Total \(money(totalMinor))\(expiry)")
                 .font(.caption).foregroundColor(Palette.console)
                 .fixedSize(horizontal: false, vertical: true)
         }
