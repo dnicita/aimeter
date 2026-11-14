@@ -842,7 +842,8 @@ struct CodexWindow: Equatable {
 
     /// "5 hour", "7 day", "30 day"…
     var label: String {
-        windowMinutes % 1440 == 0 ? "\(windowMinutes / 1440) day"
+        windowMinutes <= 0 ? "window"
+            : windowMinutes % 1440 == 0 ? "\(windowMinutes / 1440) day"
             : windowMinutes % 60 == 0 ? "\(windowMinutes / 60) hour" : "\(windowMinutes) min"
     }
 }
@@ -1635,17 +1636,32 @@ class UsageManager: ObservableObject {
             #"{"jsonrpc":"2.0","method":"initialized"}"#,
             #"{"jsonrpc":"2.0","id":2,"method":"account/rateLimits/read"}"#,
         ]
-        stdin.fileHandleForWriting.write((requests.joined(separator: "\n") + "\n").data(using: .utf8)!)
+        // If codex died at startup the pipe has no reader: without these two guards
+        // the write would SIGPIPE (or raise an ObjC exception) and take AIMeter down.
+        let writer = stdin.fileHandleForWriting
+        _ = fcntl(writer.fileDescriptor, F_SETNOSIGPIPE, 1)
+        do {
+            try writer.write(contentsOf: Data((requests.joined(separator: "\n") + "\n").utf8))
+        } catch {
+            return .failure("codex exited at startup")
+        }
 
-        // Read newline-delimited JSON until our id 2 arrives (or timeout).
+        // Read newline-delimited JSON until our id 2 arrives (or timeout). The
+        // handler runs on a background queue: `lock` guards buffer/answer against
+        // the timeout path reading `answer` while a late callback is still running.
         let reader = stdout.fileHandleForReading
         let deadline = Date().addingTimeInterval(20)
+        let lock = NSLock()
         var buffer = Data()
         var answer: CodexResult = .failure("codex timed out")
         let done = DispatchSemaphore(value: 0)
         reader.readabilityHandler = { h in
+            lock.lock(); defer { lock.unlock() }
             let chunk = h.availableData
-            if chunk.isEmpty { h.readabilityHandler = nil; done.signal(); return }
+            if chunk.isEmpty {   // EOF: codex quit before answering
+                answer = .failure("codex exited without answering")
+                h.readabilityHandler = nil; done.signal(); return
+            }
             buffer.append(chunk)
             while let nl = buffer.firstIndex(of: 0x0A) {
                 let line = buffer[buffer.startIndex..<nl]
@@ -1665,6 +1681,7 @@ class UsageManager: ObservableObject {
         }
         _ = done.wait(timeout: .now() + deadline.timeIntervalSinceNow)
         reader.readabilityHandler = nil
+        lock.lock(); defer { lock.unlock() }
         return answer
     }
 
