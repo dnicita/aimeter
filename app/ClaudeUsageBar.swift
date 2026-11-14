@@ -853,6 +853,21 @@ struct CodexWindow: Equatable {
     let windowMinutes: Int
     let resetsAt: Date?
 
+    /// Snapshot naming: "(5 h)", "(7 d)", "(30 d)" like the Claude lines.
+    var shortDuration: String {
+        windowMinutes <= 0 ? "unknown"
+            : windowMinutes % 1440 == 0 ? "\(windowMinutes / 1440) d"
+            : windowMinutes % 60 == 0 ? "\(windowMinutes / 60) h" : "\(windowMinutes) min"
+    }
+    var quotaName: String {
+        switch windowMinutes {
+        case 300:   return "session"
+        case 10080: return "weekly"
+        case 43200: return "monthly"
+        default:    return "quota"
+        }
+    }
+
     /// "5 hour", "7 day", "30 day"…
     var label: String {
         windowMinutes <= 0 ? "window"
@@ -1780,22 +1795,27 @@ class UsageManager: ObservableObject {
         out.append("# AIMeter export — \(iso.string(from: Date()))")
         out.append("")
         out.append("## Claude Max plan quotas (claude.ai, percent of window used)")
-        out.append("- Session (5 h): \(sessionUsage)% used, resets \(when(sessionResetsAt))")
-        out.append("- Weekly, all models (7 d): \(weeklyUsage)% used, resets \(when(weeklyResetsAt))")
+        // Contract with the reader (a Claude Code session): one section per vendor,
+        // vendor name first in the title; every quota line has the same shape
+        // "- <name> (<duration>): <N>% used, resets <ISO>"; a missing value stays on
+        // its line as "unknown" instead of the line disappearing.
+        let known = hasFetchedData
+        out.append("- Session (5 h): \(known ? "\(sessionUsage)" : "unknown")% used, resets \(when(sessionResetsAt))")
+        out.append("- Weekly, all models (7 d): \(known ? "\(weeklyUsage)" : "unknown")% used, resets \(when(weeklyResetsAt))")
         for sw in scopedWeekly {
             out.append("- Weekly \(sw.name) (7 d): \(sw.percent)% used, resets \(when(sw.resetsAt))")
         }
         out.append("")
-        out.append("## Max extra-usage credits (claude.ai → Settings → Usage; used when the plan quota is exhausted)")
+        out.append("## Claude Max extra-usage credits (claude.ai → Settings → Usage; used when the plan quota is exhausted)")
         if let m = extraCreditsMinor {
             let granted = extraCreditsGrantedMinor.map { " of \(money($0, extraCreditsCurrency)) granted" } ?? ""
             out.append("- Remaining: \(money(m, extraCreditsCurrency))\(granted)")
             out.append(contentsOf: trancheLines(extraTranches, extraCreditsCurrency))
         } else {
-            out.append("- Not available\(extraCreditsError.map { " (\($0))" } ?? "")")
+            out.append("- Remaining: unknown\(extraCreditsError.map { " (\($0))" } ?? "")")
         }
         out.append("")
-        out.append("## Console API credits (platform.claude.com → Billing; spent by API keys, Claude Code on API billing, Agent SDK, Playground)")
+        out.append("## Claude Console API credits (platform.claude.com → Billing; spent by API keys, Claude Code on API billing, Agent SDK, Playground)")
         if let total = consoleCreditsMinor {
             out.append("- Total remaining: \(money(total, consoleCurrency))")
             out.append("- Purchased credits remaining: \(money(consolePurchasedMinor, consoleCurrency))")
@@ -1804,16 +1824,20 @@ class UsageManager: ObservableObject {
             out.append(contentsOf: trancheLines(consolePromoTranches, consoleCurrency))
             if consolePromoTranches.isEmpty { out.append("  - none") }
         } else {
-            out.append("- Not available\(consoleCreditsError.map { " (\($0))" } ?? "")")
+            let why = consoleCreditsError.map { " (\($0))" } ?? ""
+            out.append("- Total remaining: unknown\(why)")
+            out.append("- Purchased credits remaining: unknown")
+            out.append("- Promotional credits remaining: unknown")
         }
         out.append("")
         out.append("## OpenAI Codex (local codex CLI login, percent of window used)")
+        out.append("- Plan: \(codexPlan ?? "unknown")")
         if codexWindows.isEmpty {
-            out.append("- Not available\(codexError.map { " (\($0))" } ?? " (codex CLI not installed)")")
+            let why = codexError ?? (UsageManager.codexExecutable() == nil ? "codex CLI not installed" : "not fetched yet")
+            out.append("- Codex (unknown): unknown% used, resets unknown (\(why))")
         } else {
-            out.append("- Plan: \(codexPlan ?? "unknown")")
             for w in codexWindows {
-                out.append("- Window (\(w.label)): \(w.percent)% used, resets \(when(w.resetsAt))")
+                out.append("- Codex, \(w.quotaName) (\(w.shortDuration)): \(w.percent)% used, resets \(when(w.resetsAt))")
             }
         }
         out.append("")
