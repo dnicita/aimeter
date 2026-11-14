@@ -1049,6 +1049,13 @@ class UsageManager: ObservableObject {
     private var agyFetching = false
     private var agyLastFetch: Date?
 
+    // When each source last answered successfully (snapshot "- Fetched:" lines):
+    // sources refresh on different cadences, so one global time is not enough.
+    private var extraFetchedAt: Date?
+    private var consoleFetchedAt: Date?
+    private var codexFetchedAt: Date?
+    private var agyFetchedAt: Date?
+
     private func minutesUntil(_ date: Date?) -> Int? {
         guard let date = date else { return nil }
         let s = Int(date.timeIntervalSinceNow)
@@ -1623,6 +1630,7 @@ class UsageManager: ObservableObject {
         let granted = extraTranches.map(\.grantedMinor).reduce(0, +)
         extraCreditsGrantedMinor = granted > 0 ? granted : nil
         extraCreditsError = nil
+        extraFetchedAt = Date()
         vlog("💳 Credits: \(amount.intValue) \(extraCreditsCurrency) remaining of \(granted)")
     }
 
@@ -1699,6 +1707,7 @@ class UsageManager: ObservableObject {
         consolePromoExpires = consolePromoTranches.compactMap(\.expiresAt).min()
         consoleCreditsError = nil
         statusMessage = nil   // clears "Console cookie saved, fetching…" like parseUsageData does
+        consoleFetchedAt = Date()
         vlog("💳 Console credits: \(amount.intValue) \(consoleCurrency) (purchased \(consolePurchasedMinor), promo \(consolePromoMinor))")
     }
 
@@ -1826,6 +1835,7 @@ class UsageManager: ObservableObject {
         codexWindows = [window("primary"), window("secondary")].compactMap { $0 }
         codexPlan = limits["planType"] as? String
         codexError = codexWindows.isEmpty ? "No Codex limits reported" : nil
+        if !codexWindows.isEmpty { codexFetchedAt = Date() }
         vlog("🤖 Codex: \(codexWindows.map { "\($0.percent)%/\($0.label)" }) plan \(codexPlan ?? "?")")
     }
 
@@ -1917,6 +1927,7 @@ class UsageManager: ObservableObject {
         }
         agyQuotas = parsed
         agyError = parsed.isEmpty ? "No Antigravity quota reported" : nil
+        if !parsed.isEmpty { agyFetchedAt = Date() }
         vlog("🪐 Antigravity: \(parsed.map { "\($0.group) \($0.percent)%" })")
     }
 
@@ -1961,11 +1972,15 @@ class UsageManager: ObservableObject {
         func usedLeft(_ used: Int) -> String { "\(used)% used, \(max(0, 100 - used))% left" }
 
         var out: [String] = []
+        func fetched(_ d: Date?) -> String { "- Fetched: \(d.map { iso.string(from: $0) } ?? "unknown")" }
         out.append("# AIMeter export — \(iso.string(from: Date()))")
         out.append("")
-        out.append("Format: one `## <Vendor> …` section per vendor (Claude, OpenAI, Google). Quota lines are `- <name> (<duration>): <N>% used, <M>% left, resets <ISO 8601> (in <countdown>)`. `unknown` means the value is not available. Quota lines appear and disappear as vendors add or drop limits: read every `% used` line in a section, do not rely on names or positions.")
+        // Bump when the shape of the lines changes, so the reader can notice.
+        out.append("Format version: 2")
+        out.append("Format: one `## <Vendor> …` section per vendor (Claude, OpenAI, Google). Quota lines are `- <name> (<duration>): <N>% used, <M>% left, resets <ISO 8601> (in <countdown>)`. `unknown` means the value is not available. Quota lines appear and disappear as vendors add or drop limits: read every `% used` line in a section, do not rely on names or positions. Each section has a `- Fetched: <ISO 8601>` line: when that source last answered.")
         out.append("")
         out.append("## Claude Max plan quotas (claude.ai, percent of window used)")
+        out.append(fetched(lastSuccessfulUpdate))
         // Contract with the reader (a Claude Code session): one section per vendor,
         // vendor name first in the title; every quota line has the same shape
         // "- <name> (<duration>): <N>% used, <M>% left, resets <ISO>"; a missing value stays on
@@ -1978,6 +1993,7 @@ class UsageManager: ObservableObject {
         }
         out.append("")
         out.append("## Claude Max extra-usage credits (claude.ai → Settings → Usage; used when the plan quota is exhausted)")
+        out.append(fetched(extraFetchedAt))
         if let m = extraCreditsMinor {
             let granted = extraCreditsGrantedMinor.map { " of \(money($0, extraCreditsCurrency)) granted" } ?? ""
             out.append("- Remaining: \(money(m, extraCreditsCurrency))\(granted)")
@@ -1987,6 +2003,7 @@ class UsageManager: ObservableObject {
         }
         out.append("")
         out.append("## Claude Console API credits (platform.claude.com → Billing; spent by API keys, Claude Code on API billing, Agent SDK, Playground)")
+        out.append(fetched(consoleFetchedAt))
         if let total = consoleCreditsMinor {
             out.append("- Total remaining: \(money(total, consoleCurrency))")
             out.append("- Purchased credits remaining: \(money(consolePurchasedMinor, consoleCurrency))")
@@ -2002,6 +2019,7 @@ class UsageManager: ObservableObject {
         }
         out.append("")
         out.append("## OpenAI Codex (local codex CLI login, percent of window used)")
+        out.append(fetched(codexFetchedAt))
         out.append("- Plan: \(codexPlan ?? "unknown")")
         if codexWindows.isEmpty {
             let why = codexError ?? (UsageManager.codexExecutable() == nil ? "codex CLI not installed" : "not fetched yet")
@@ -2013,6 +2031,7 @@ class UsageManager: ObservableObject {
         }
         out.append("")
         out.append("## Google Antigravity (local agy CLI login, percent of window used)")
+        out.append(fetched(agyFetchedAt))
         out.append("- Plan: unknown")
         if agyQuotas.isEmpty {
             let why = agyError ?? (UsageManager.agyExecutable() == nil ? "agy CLI not installed" : "not fetched yet")
