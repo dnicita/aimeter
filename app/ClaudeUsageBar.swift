@@ -261,6 +261,8 @@ enum Palette {
                                dark:  NSColor(srgbRed: 0.95, green: 0.71, blue: 1.00, alpha: 1))  // #F2B5FF
     static let consoleNS = dyn(light: NSColor(srgbRed: 0.04, green: 0.56, blue: 0.43, alpha: 1),  // #0A8F6E
                                dark:  NSColor(srgbRed: 0.66, green: 0.96, blue: 0.86, alpha: 1))  // #A8F5DC
+    static let agyNS     = dyn(light: NSColor(srgbRed: 0.30, green: 0.30, blue: 0.33, alpha: 1),  // #4D4D54
+                               dark:  NSColor(srgbRed: 0.92, green: 0.92, blue: 0.94, alpha: 1))  // #EBEBF0
     static let codexNS   = dyn(light: NSColor(srgbRed: 0.48, green: 0.42, blue: 0.00, alpha: 1),  // #7A6B00
                                dark:  NSColor(srgbRed: 1.00, green: 0.94, blue: 0.63, alpha: 1))  // #FFF0A0
 
@@ -269,6 +271,7 @@ enum Palette {
     static let model   = Color(.sRGB, red: 0.85, green: 0.50, blue: 0.02)  // darker #D98005
     static let credits = Color(.sRGB, red: 0.55, green: 0.31, blue: 0.85)  // darker #8C4FD9
     static let console = Color(.sRGB, red: 0.06, green: 0.61, blue: 0.47)  // darker #0F9B78
+    static let agy     = Color(.sRGB, red: 0.42, green: 0.42, blue: 0.45)  // graphite #6B6B73
     static let codex   = Color(.sRGB, red: 0.60, green: 0.52, blue: 0.00)  // dark gold #998500
     static let alert   = Color(.sRGB, red: 1.00, green: 0.23, blue: 0.19)
 
@@ -742,6 +745,15 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
             seg((first ? " " : "  ") + parts.joined(separator: " "), Palette.limitColors(l.kind).bar)
             first = false
         }
+        // Antigravity pools: same per-item options as the Claude limits.
+        for q in um.agyQuotas {
+            let o = um.barSettings(for: q.id)
+            var parts: [String] = []
+            if um.showPercent(mode: o.percentMode, value: q.percent, threshold: o.percentThreshold) { parts.append("\(q.percent)%") }
+            if um.showTimer(mode: o.timerMode, date: q.resetsAt, threshold: o.timerThreshold),
+               let t = UsageManager.countdown(to: q.resetsAt) { parts.append(t) }
+            if !parts.isEmpty { seg("  " + parts.joined(separator: " "), Palette.agyNS) }
+        }
         // Money balances: Max extra-usage credits, Console API credits.
         if um.showExtraCredits, let t = um.extraCreditsText { seg("  " + t, Palette.creditsNS) }
         // Console: purchased credits, then the promotional bonus marked with "+".
@@ -900,6 +912,27 @@ struct LimitBarSettings: Codable, Equatable {
 ///   • usage notifications (per-threshold, session-reset, reset-imminent),
 ///   • the conditional menu-bar visibility logic (show* computed properties).
 /// Network callbacks marshal back to the main thread before mutating @Published state.
+/// One Google Antigravity quota bucket, as `agy --print /quota` reports it (one
+/// shared weekly pool per model group today).
+struct AgyQuota: Equatable, Identifiable {
+    let id: String          // settings key: "agy:<bucket id>"
+    let group: String       // "Gemini Models", "Claude and GPT models"
+    let window: String      // "weekly", "5h"…
+    let percent: Int        // USED percent (the CLI reports the remaining fraction)
+    let resetsAt: Date?
+
+    /// "7 d" / "5 h" like the other snapshot lines; nil when unrecognized.
+    var duration: String? {
+        switch window {
+        case "weekly": return "7 d"
+        case "daily":  return "1 d"
+        case "5h":     return "5 h"
+        default:       return nil
+        }
+    }
+    var rowTitle: String { "Antigravity · \(group)" + (window.isEmpty ? "" : " (\(window))") }
+}
+
 /// One Codex rate-limit window (free plan: a single 30-day window; paid plans add
 /// a 5-hour primary + weekly secondary).
 struct CodexWindow: Equatable {
@@ -1010,19 +1043,25 @@ class UsageManager: ObservableObject {
     @Published var codexTimerThreshold: Int = 60            // minutes
     private var codexFetching = false
 
+    // Google Antigravity quota (fork), read from the local `agy` CLI.
+    @Published var agyQuotas: [AgyQuota] = []
+    @Published var agyError: String?
+    private var agyFetching = false
+    private var agyLastFetch: Date?
+
     private func minutesUntil(_ date: Date?) -> Int? {
         guard let date = date else { return nil }
         let s = Int(date.timeIntervalSinceNow)
         return s > 0 ? s / 60 : 0
     }
-    private func showPercent(mode: BarMode, value: Int, threshold: Int) -> Bool {
+    func showPercent(mode: BarMode, value: Int, threshold: Int) -> Bool {
         switch mode {
         case .always: return true
         case .when:   return value >= threshold
         case .off:    return false
         }
     }
-    private func showTimer(mode: BarMode, date: Date?, threshold: Int) -> Bool {
+    func showTimer(mode: BarMode, date: Date?, threshold: Int) -> Bool {
         switch mode {
         case .always: return true
         case .when:   if let m = minutesUntil(date) { return m <= threshold }; return false
@@ -1491,6 +1530,7 @@ class UsageManager: ObservableObject {
         // both regardless of the claude.ai cookie.
         fetchConsoleCredits()
         fetchCodexUsage()
+        fetchAntigravityUsage()
 
         guard !sessionCookie.isEmpty else {
             self.errorMessage = "Session cookie not set"
@@ -1789,6 +1829,97 @@ class UsageManager: ObservableObject {
         vlog("🤖 Codex: \(codexWindows.map { "\($0.percent)%/\($0.label)" }) plan \(codexPlan ?? "?")")
     }
 
+    // MARK: - Google Antigravity quota (fork)
+    //
+    // `agy --print /quota --output-format json` runs the CLI's own /quota command
+    // headless: it authenticates with its own Google login, spends no tokens and
+    // exits in ~3 s. AIMeter never touches agy's credentials. (Idea from
+    // greenoxz/agy-quota-bar. The CLI's localhost server needs a CSRF token as of
+    // agy 1.5.x, so that route is closed.) Weekly pools move slowly and every run
+    // leaves a small log file, so it is polled at most every 15 minutes.
+
+    nonisolated static func agyExecutable() -> String? {
+        let home = FileManager.default.homeDirectoryForCurrentUser.path
+        return ["\(home)/.local/bin/agy", "/opt/homebrew/bin/agy", "/usr/local/bin/agy"]
+            .first { FileManager.default.isExecutableFile(atPath: $0) }
+    }
+
+    func fetchAntigravityUsage(force: Bool = false) {
+        guard !agyFetching, let exe = UsageManager.agyExecutable() else { return }
+        if !force, let last = agyLastFetch, Date().timeIntervalSince(last) < 15 * 60 { return }
+        agyFetching = true
+        agyLastFetch = Date()
+        DispatchQueue.global(qos: .utility).async {
+            let output = UsageManager.runCLI(executable: exe, arguments: ["--print", "/quota", "--output-format", "json"], timeout: 30)
+            Task { @MainActor in
+                self.agyFetching = false
+                self.parseAntigravityQuota(output)
+                self.writeSnapshotFile()
+                self.updateStatusBar()
+            }
+        }
+    }
+
+    /// Run a CLI to completion and return its stdout; nil on launch failure or timeout.
+    nonisolated static func runCLI(executable: String, arguments: [String], timeout: TimeInterval) -> Data? {
+        let proc = Process()
+        proc.executableURL = URL(fileURLWithPath: executable)
+        proc.arguments = arguments
+        let stdout = Pipe()
+        proc.standardInput = FileHandle.nullDevice
+        proc.standardOutput = stdout
+        proc.standardError = FileHandle.nullDevice
+        do { try proc.run() } catch { return nil }
+
+        // Drain stdout on another queue so a chatty child can't block on a full pipe.
+        let lock = NSLock()
+        var collected: Data?
+        let done = DispatchSemaphore(value: 0)
+        DispatchQueue.global(qos: .utility).async {
+            let data = stdout.fileHandleForReading.readDataToEndOfFile()
+            lock.lock(); collected = data; lock.unlock()
+            done.signal()
+        }
+        if done.wait(timeout: .now() + timeout) == .timedOut {
+            proc.terminate()
+            return nil
+        }
+        lock.lock(); defer { lock.unlock() }
+        return collected
+    }
+
+    func parseAntigravityQuota(_ output: Data?) {
+        guard let output = output else {
+            agyError = "agy did not answer"
+            return
+        }
+        guard let json = try? JSONSerialization.jsonObject(with: output) as? [String: Any],
+              let data = (json["command"] as? [String: Any])?["data"] as? [String: Any],
+              let groups = data["groups"] as? [[String: Any]] else {
+            // Not signed in, or a CLI version without the JSON /quota command.
+            let text = String(data: output, encoding: .utf8) ?? ""
+            agyError = text.lowercased().contains("sign") ? "Not signed in to Antigravity" : "Unexpected agy output"
+            return
+        }
+        var parsed: [AgyQuota] = []
+        for g in groups {
+            let groupName = (g["name"] as? String) ?? "Models"
+            for b in (g["buckets"] as? [[String: Any]]) ?? [] {
+                // No remaining_fraction = unknown: skip rather than guess 0% or 100%.
+                guard let remaining = (b["remaining_fraction"] as? NSNumber)?.doubleValue else { continue }
+                let bucketId = (b["id"] as? String) ?? "\(groupName)-\(b["window"] as? String ?? "")"
+                parsed.append(AgyQuota(
+                    id: "agy:\(bucketId)", group: groupName,
+                    window: (b["window"] as? String) ?? "",
+                    percent: Int(((1 - min(max(remaining, 0), 1)) * 100).rounded()),
+                    resetsAt: (b["reset_time"] as? String).flatMap(UsageManager.parseISODate)))
+            }
+        }
+        agyQuotas = parsed
+        agyError = parsed.isEmpty ? "No Antigravity quota reported" : nil
+        vlog("🪐 Antigravity: \(parsed.map { "\($0.group) \($0.percent)%" })")
+    }
+
     /// Tranche list as the Console sends it (`tranches` / `promo_tranches`).
     nonisolated static func parseTranches(_ raw: [[String: Any]]) -> [CreditTranche] {
         raw.compactMap { t in
@@ -1874,6 +2005,16 @@ class UsageManager: ObservableObject {
             for w in codexWindows {
                 out.append("- Codex, \(w.quotaName) (\(w.shortDuration)): \(w.percent)% used, resets \(when(w.resetsAt))")
             }
+        }
+        out.append("")
+        out.append("## Google Antigravity (local agy CLI login, percent of window used)")
+        out.append("- Plan: unknown")
+        if agyQuotas.isEmpty {
+            let why = agyError ?? (UsageManager.agyExecutable() == nil ? "agy CLI not installed" : "not fetched yet")
+            out.append("- Antigravity (unknown): unknown% used, resets unknown (\(why))")
+        }
+        for q in agyQuotas {
+            out.append("- Antigravity, \(q.group) \(q.window) (\(q.duration ?? "unknown")): \(q.percent)% used, resets \(when(q.resetsAt))")
         }
         out.append("")
         out.append("Data last fetched: \(iso.string(from: lastUpdated)). A fresh copy of this snapshot is rewritten after every refresh at \(snapshotURL.path).")
@@ -2175,6 +2316,7 @@ class UsageManager: ObservableObject {
     /// Public entry for the manual "Refresh now" button.
     func refreshNow() {
         fetchUsage()
+        fetchAntigravityUsage(force: true)
     }
 
     /// Percent (0–100) → clamped 0–1 fraction for ProgressView (the API can
@@ -2719,6 +2861,20 @@ struct UsageView: View {
                     .font(.caption).foregroundColor(.secondary)
             }
 
+            // Google Antigravity pools (fork), from the local agy CLI login.
+            ForEach(usageManager.agyQuotas) { q in
+                usageRow(title: q.rowTitle,
+                         percentage: UsageManager.fraction(q.percent),
+                         resetDate: q.resetsAt,
+                         countdown: UsageManager.countdown(to: q.resetsAt),
+                         color: Palette.agy,
+                         includeDate: true)
+            }
+            if usageManager.agyQuotas.isEmpty, let err = usageManager.agyError {
+                Text("Antigravity: \(err)")
+                    .font(.caption).foregroundColor(.secondary)
+            }
+
             if statusManager.hasFetched {
                 Divider()
             }
@@ -3150,6 +3306,18 @@ struct UsageView: View {
                         barRow("API bonus credits (Console)", Palette.console, isPercent: false, moneyCode: usageManager.consoleCurrency,
                                modeGet: { usageManager.consoleMode }, modeSet: { usageManager.consoleMode = $0 },
                                thrGet: { usageManager.consoleThreshold }, thrSet: { usageManager.consoleThreshold = $0 })
+                        ForEach(usageManager.agyQuotas) { q in
+                            barRow("Antigravity \(q.group) %", Palette.agy, isPercent: true,
+                                   modeGet: { usageManager.barSettings(for: q.id).percentMode },
+                                   modeSet: { v in usageManager.updateBarSettings(for: q.id) { $0.percentMode = v } },
+                                   thrGet: { usageManager.barSettings(for: q.id).percentThreshold },
+                                   thrSet: { v in usageManager.updateBarSettings(for: q.id) { $0.percentThreshold = v } })
+                            barRow("Antigravity \(q.group) reset timer", Palette.agy, isPercent: false,
+                                   modeGet: { usageManager.barSettings(for: q.id).timerMode },
+                                   modeSet: { v in usageManager.updateBarSettings(for: q.id) { $0.timerMode = v } },
+                                   thrGet: { usageManager.barSettings(for: q.id).timerThreshold },
+                                   thrSet: { v in usageManager.updateBarSettings(for: q.id) { $0.timerThreshold = v } })
+                        }
                         barRow("Codex usage %", Palette.codex, isPercent: true,
                                modeGet: { usageManager.codexPercentMode }, modeSet: { usageManager.codexPercentMode = $0 },
                                thrGet: { usageManager.codexPercentThreshold }, thrSet: { usageManager.codexPercentThreshold = $0 })
